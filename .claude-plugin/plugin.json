@@ -1,0 +1,17 @@
+{
+  "name": "model-advisor",
+  "version": "0.1.0",
+  "description": "Judges each prompt with Haiku 5.5 and, when a different Claude model or effort would help, offers Best, Balanced and Keep before the prompt runs.",
+  "author": {
+    "name": "Ajay"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "about": {
+      "type": "string",
+      "title": "About your work",
+      "description": "One or two sentences on what you use Claude Code for (for example: 'Indie iOS developer; also writes marketing copy and handles client contracts'). The judge reads it to rate your prompts. Leave empty for a neutral default.",
+      "default": ""
+    }
+  }
+}

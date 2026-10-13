@@ -1,0 +1,5 @@
+{
+  "name": "model-advisor",
+  "owner": { "name": "Ajay" },
+  "plugins": [{ "name": "model-advisor", "source": "./", "description": "Recommends the right Claude model and effort for each prompt, and asks before switching." }]
+}
