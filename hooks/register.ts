@@ -27,6 +27,7 @@ type Choice = 'best' | 'balanced' | 'keep' | 'silent'
 export type LogEntry = {
   at: string
   kind: 'main' | 'subagent'
+  origin?: string
   tier: string
   domain: string
   flags: string[]
@@ -110,6 +111,21 @@ function limitsOf(rateLimits: readonly { kind: string; percentUsed: number }[]) 
   }
 }
 
+// Prompts nobody typed or handed off: background-task notices, scheduled runs,
+// messages between sessions, observers, channels, the mod's own. Everything
+// else is judged: the terminal, the desktop app (an SDK host), the phone, a
+// chip's hand-off, and prompts the engine cannot name.
+const MACHINE_ORIGINS = new Set<string>([
+  'task-notification', 'scheduled-trigger', 'peer', 'peer-send-message', 'channel',
+  'observer', 'observer-activity', 'auto-continuation', 'slack-ping', 'plugin',
+])
+
+// The app prefixes some prompts with <system-reminder> blocks (worktree path,
+// linked sessions); the judge reads only the person's own words.
+function ownWords(text: string): string {
+  return text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
+}
+
 // The plugin's `about` setting, read when the module loads.
 let about = ''
 
@@ -146,8 +162,9 @@ export const register: Register = (on, options) => {
   })
 
   on('prompt.submit', async ($, e, next) => {
-    if (e.origin.kind !== 'composer' && e.origin.kind !== 'bridge') return next(e)
-    if ((await $.state.get(IS_OFF)).value || isSkippable(e.text)) return next(e)
+    if (MACHINE_ORIGINS.has(e.origin.kind)) return next(e)
+    const text = ownWords(e.text)
+    if ((await $.state.get(IS_OFF)).value || isSkippable(text)) return next(e)
 
     const [rows, usage, { setup: current, isLatest }] = await Promise.all([
       $.session.messages() as Promise<SessionMessage[]>,
@@ -156,13 +173,13 @@ export const register: Register = (on, options) => {
     ])
     const isFirstPrompt = !rows.some(m => m.role === 'user' && m.text.trim())
     const contextTokens = isFirstPrompt ? 0 : usage.context.tokens ?? 0
-    const { verdict, ms, previousTier } = await judge($, e.text, recentTurns(rows), isFirstPrompt, contextTokens, JUDGE_TIMEOUT_MS)
+    const { verdict, ms, previousTier } = await judge($, text, recentTurns(rows), isFirstPrompt, contextTokens, JUDGE_TIMEOUT_MS)
     if (!verdict) {
       if (isFirstPrompt) $.ui.toast('Model advisor: could not check this prompt, so it runs as set')
       return next(e)
     }
 
-    const statedPick = stated(e.text)
+    const statedPick = stated(text)
     const limits = limitsOf(usage.rateLimits)
     const d = decide(verdict, {
       current, currentIsLatest: isLatest, stated: statedPick, isFirstPrompt, contextTokens, previousTier, limits,
@@ -173,7 +190,7 @@ export const register: Register = (on, options) => {
     const pick = chosen === 'best' ? d.best : chosen === 'balanced' ? d.balanced : undefined
     await $.state.set(PREVIOUS_TIER, d.tier)
     await appendLog($, entry(verdict, {
-      kind: 'main', first: isFirstPrompt, contextK: Math.round(contextTokens / 1000), current: label(current),
+      kind: 'main', origin: e.origin.kind, first: isFirstPrompt, contextK: Math.round(contextTokens / 1000), current: label(current),
       best: label(d.best), balanced: label(d.balanced), chosen, stated: !!statedPick, held: d.held, judgeMs: ms,
     }))
     // One brief sign on the first prompt that the advisor checked and found nothing to change.

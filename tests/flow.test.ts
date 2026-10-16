@@ -14,17 +14,17 @@ const answered = (): ModelCompleteResult => ({ isAnswered: true, text: deepLegal
 
 type World = {
   asked: string[][]; descriptions: string[][]; logs: string[]; toasts: string[]; status: (string | undefined)[]
-  seen: TurnStepInput[]; judged: number; systems: string[]
+  seen: TurnStepInput[]; judged: number; systems: string[]; prompts: string[]
 }
 
 function session(on: On, answer: (labels: string[]) => string, judge: () => ModelCompleteResult = answered): World {
-  const w: World = { asked: [], descriptions: [], logs: [], toasts: [], status: [], seen: [], judged: 0, systems: [] }
+  const w: World = { asked: [], descriptions: [], logs: [], toasts: [], status: [], seen: [], judged: 0, systems: [], prompts: [] }
   mock.store(on)
   on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
   on('session.messages', () => ({ value: [] }))
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1_000_000, tokens: 0 }, rateLimits: [] } }))
   on('settings.read', () => ({ value: { effortLevel: 'medium' } }))
-  on('model.complete', (_$, e) => ((w.judged += 1), w.systems.push(e.system ?? ''), { value: judge() }))
+  on('model.complete', (_$, e) => ((w.judged += 1), w.systems.push(e.system ?? ''), w.prompts.push(e.prompt), { value: judge() }))
   on('ui.status', (_$, e) => (w.status.push(e.text), { value: undefined }))
   on('ui.toast', (_$, e) => (w.toasts.push(e.text), { value: undefined }))
   on('ui.log', (_$, e) => (w.logs.push(e.text), { value: undefined }))
@@ -129,4 +129,31 @@ test('with no about setting the judge gets a neutral description', async ($, on)
   const w = session(on, labels => labels[0]!)
   await $.prompt.submit({ text: NOTICE, ...composer })
   expect(w.systems[0]).toContain('About the person: Their work is a mix of software')
+})
+
+test('prompts from the desktop app, a hand-off or with no named source are judged', async ($, on) => {
+  const w = session(on, labels => labels.at(-1)!)
+  for (const origin of [{ kind: 'sdk' as const }, { kind: 'unclassified' as const }, { kind: 'coordinator' as const }, { kind: 'bridge' as const }])
+    await $.prompt.submit({ text: NOTICE, wait: false, origin })
+  expect(w.judged).toBe(4)
+})
+
+test('background notices and scheduled runs are not judged', async ($, on) => {
+  const w = session(on, labels => labels.at(-1)!)
+  for (const origin of [{ kind: 'task-notification' as const }, { kind: 'scheduled-trigger' as const }])
+    await $.prompt.submit({ text: NOTICE, wait: false, origin })
+  expect(w.judged).toBe(0)
+})
+
+test('the app reminder blocks are stripped before judging', async ($, on) => {
+  const w = session(on, labels => labels.at(-1)!)
+  await $.prompt.submit({ text: `<system-reminder>\nYou are operating in a git worktree.\n</system-reminder>\n${NOTICE}`, ...composer })
+  expect(w.prompts[0]).toContain(NOTICE)
+  expect(w.prompts[0]).not.toContain('git worktree')
+})
+
+test('a prompt that is only an app reminder is skipped', async ($, on) => {
+  const w = session(on, labels => labels.at(-1)!)
+  await $.prompt.submit({ text: '<system-reminder>\nLinked sessions now: none.\n</system-reminder>', ...composer })
+  expect(w.judged).toBe(0)
 })
