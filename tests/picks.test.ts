@@ -150,6 +150,24 @@ describe('noise', () => {
     expect(d.speak).toBe(false)
   })
 
+  test('legal, tender and risky work on Opus medium still asks for high', () => {
+    for (const v of [
+      verdict({ tier: 'deep', domain: 'legal', flags: ['outside_audience'], confidence: 'high' }),
+      verdict({ tier: 'deep', domain: 'tender', confidence: 'medium' }),
+      verdict({ risky: true, flags: ['production'], confidence: 'high' }),
+    ]) {
+      const d = decide(v, mid({ current: { model: 'opus', effort: 'medium' } }))
+      expect(label(d.best)).toBe('Opus 5.5 · high')
+      expect(d.speak).toBe(true)
+    }
+  })
+
+  test('Sonnet medium to high is worth a question', () => {
+    const d = decide(verdict({ domain: 'website', confidence: 'high' }), first({ current: { model: 'sonnet', effort: 'medium' } }))
+    expect(label(d.best)).toBe('Sonnet 5.5 · high')
+    expect(d.speak).toBe(true)
+  })
+
   test('a bigger step up (high to xhigh) still asks', () => {
     const d = decide(verdict({ tier: 'deep', flags: ['unknown_cause'], confidence: 'high' }), mid({ current: { model: 'opus', effort: 'high' } }))
     expect(d.speak).toBe(true)

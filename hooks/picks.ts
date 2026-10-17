@@ -224,8 +224,11 @@ export function decide(verdict: Verdict, ctx: PickContext): Decision {
 
   // Speak only when a change would help: any move up, a model change, or an
   // effort-only move down that saves at least 40%. Smaller savings are not worth a question.
-  // A same-model effort step up under 1.5x (medium to high) is not worth a question.
+  // A same-model effort step up under 1.5x (Opus medium to high) is not worth a
+  // question, except for never-route-down or risky work, and on Sonnet, which
+  // gains far more from medium to high.
   const smallStepUp = (pick: Setup) =>
+    !neverDown && !v.risky && pick.model === 'opus' &&
     pick.model === ctx.current.model && weight(pick) > weight(ctx.current) && weight(pick) / weight(ctx.current) < 1.5
   const helps = (pick: Setup) =>
     !(same(pick, ctx.current) && ctx.currentIsLatest !== false) &&
