@@ -88,6 +88,16 @@ function table(tier: Tier, domain: Domain, v: Verdict, isFirstPrompt: boolean): 
   }
 }
 
+// Mechanical work (install, push, rename, a known command) needs care, not a
+// stronger model. A verdict counts as mechanical only when the work is at most
+// standard (a continuation carries the tier of the work it continues) and
+// nothing in it needs reasoning: no unknown cause, failed attempt or many sources.
+export function isMechanical(v: Verdict): boolean {
+  if (!v.mechanical) return false
+  if (v.flags.some(f => f === 'unknown_cause' || f === 'failed_before' || f === 'many_sources')) return false
+  return v.continuation || TIER_RANK[v.tier] <= TIER_RANK.standard
+}
+
 export function isNeverDown(v: Verdict, tier: Tier): boolean {
   if (v.risky) return true
   if (v.domain === 'legal' || v.domain === 'tender') return true
@@ -110,6 +120,11 @@ function atLeast(x: Setup, floor: Setup): Setup {
   return weight(x) >= weight(floor) ? x : floor
 }
 
+// Down means a lower model family or less usage: Opus low to Sonnet medium is down.
+const below = (x: Setup, y: Setup) => MODEL_WEIGHT[x.model] < MODEL_WEIGHT[y.model] || weight(x) < weight(y)
+
+const effortNotchDown = (x: Setup): Setup => ({ ...x, effort: EFFORTS[Math.max(0, EFFORTS.indexOf(x.effort) - 1)] ?? 'low' })
+
 // Re-read cost of a model switch against what the cheaper model saves over
 // two prompts (about 33 requests each), in dollars at list prices.
 const CACHE_WRITE: Record<ModelKey, number> = { haiku: 0.125, sonnet: 2.5, opus: 5, fable: 12.5 }
@@ -127,7 +142,7 @@ export function switchCost(from: ModelKey, to: ModelKey, contextTokens: number) 
 
 // A mid-session move to a cheaper model must pay back its re-read within two
 // prompts and the work must be ongoing; otherwise keep the model, change effort.
-function keepModelIfSwitchDoesNotPay(pick: Setup, ctx: PickContext, v: Verdict): Setup {
+function keepModelIfSwitchDoesNotPay(pick: Setup, ctx: PickContext, v: Verdict, tier: Tier): Setup {
   if (ctx.isFirstPrompt || pick.model === ctx.current.model) return pick
   const cheaperModel = MODEL_WEIGHT[pick.model] < MODEL_WEIGHT[ctx.current.model]
   if (!cheaperModel) return pick // moving up is for quality; it is always allowed
@@ -135,7 +150,11 @@ function keepModelIfSwitchDoesNotPay(pick: Setup, ctx: PickContext, v: Verdict):
   if (v.ongoing && savedOverTwoPrompts > reread) return pick
   // Same model, effort no higher than the pick asked for at its own weight.
   const effort = [...EFFORTS].reverse().find(e => weight(s(ctx.current.model, e)) <= weight(pick) * 1.5) ?? 'low'
-  return s(ctx.current.model, effort)
+  if (TIER_RANK[tier] < TIER_RANK.deep) return s(ctx.current.model, effort)
+  // Deep work keeps at least the table's effort, and never below medium: Fable
+  // low is no stand-in for Opus high.
+  const floor = Math.max(EFFORTS.indexOf(effort), EFFORTS.indexOf(pick.effort), EFFORTS.indexOf('medium'))
+  return s(ctx.current.model, EFFORTS[floor] ?? pick.effort)
 }
 
 // Subagents start fresh (no cache to lose), so they are routed without a
@@ -143,7 +162,7 @@ function keepModelIfSwitchDoesNotPay(pick: Setup, ctx: PickContext, v: Verdict):
 export function subagentModel(v: Verdict, parent: ModelKey): ModelKey {
   const tier = v.tier === 'light' && v.flags.length > 0 ? 'standard' : v.tier
   const pick: ModelKey =
-    v.mechanical && !v.risky ? 'haiku'
+    isMechanical(v) && !v.risky ? 'haiku'
     : tier === 'light' ? 'haiku'
     : tier === 'standard' ? (v.domain === 'code' || v.domain === 'ios' ? 'opus' : 'sonnet')
     : 'opus'
@@ -155,23 +174,23 @@ export function subagentModel(v: Verdict, parent: ModelKey): ModelKey {
 export function decide(verdict: Verdict, ctx: PickContext): Decision {
   // A first prompt continues nothing in this session.
   const v = ctx.isFirstPrompt ? { ...verdict, continuation: false } : verdict
+  const mechanical = isMechanical(v)
   let tier = v.tier
   // Frontier needs evidence: an earlier attempt failed, or many sources.
   if (tier === 'frontier' && !v.flags.some(f => f === 'failed_before' || f === 'many_sources')) tier = 'deep'
-  // Mechanical work (install, push, rename, a known command) needs care, not a
-  // stronger model: it is light, and never-route-down below keeps a risky act where it is.
-  if (v.mechanical) tier = 'light'
+  // Mechanical work is light, and never-route-down below keeps a risky act where it is.
+  if (mechanical) tier = 'light'
   // Continuations inherit the tier of the work and are never routed down.
-  if (v.continuation && !v.mechanical && ctx.previousTier && TIER_RANK[ctx.previousTier] > TIER_RANK[tier]) tier = ctx.previousTier
+  if (v.continuation && !mechanical && ctx.previousTier && TIER_RANK[ctx.previousTier] > TIER_RANK[tier]) tier = ctx.previousTier
   // Any up-flag lifts a light verdict.
-  if (tier === 'light' && v.flags.length > 0 && !v.mechanical) tier = 'standard'
+  if (tier === 'light' && v.flags.length > 0 && !mechanical) tier = 'standard'
   const neverDown = isNeverDown(v, tier) || (v.continuation && (tier === 'deep' || tier === 'frontier'))
-  if (neverDown && tier === 'light' && !v.mechanical) tier = 'standard'
+  if (neverDown && tier === 'light' && !mechanical) tier = 'standard'
 
   let { best, balanced } = table(tier, v.domain, v, ctx.isFirstPrompt)
 
   // Risky acts run on Opus 5.5 at high or above.
-  if (v.risky && !v.mechanical) {
+  if (v.risky && !mechanical) {
     best = atLeast(best, s('opus', 'high'))
     if (best.model !== 'opus' && best.model !== 'fable') best = s('opus', 'high')
   }
@@ -189,8 +208,8 @@ export function decide(verdict: Verdict, ctx: PickContext): Decision {
   }
 
   // Two-prompt rule for mid-session switches to a cheaper model.
-  best = keepModelIfSwitchDoesNotPay(best, ctx, v)
-  balanced = keepModelIfSwitchDoesNotPay(balanced, ctx, v)
+  best = keepModelIfSwitchDoesNotPay(best, ctx, v, tier)
+  balanced = keepModelIfSwitchDoesNotPay(balanced, ctx, v, tier)
 
   // In a big conversation on Opus, Balanced prefers Opus at low effort over a
   // move to Sonnet: about the same usage, no re-read (effort keeps the cache).
@@ -202,11 +221,13 @@ export function decide(verdict: Verdict, ctx: PickContext): Decision {
   // Mid-session, a one-off aside never moves the session down: the choice
   // sticks, so the work after it would inherit the cheaper setup.
   let held: string | undefined
-  const hold = (why: string) => {
-    if (weight(best) < weight(ctx.current)) (best = ctx.current), (held = why)
-    if (weight(balanced) < weight(ctx.current)) (balanced = ctx.current), (held = why)
+  const hold = (why: string, balancedFloor = ctx.current) => {
+    if (below(best, ctx.current)) (best = ctx.current), (held = why)
+    if (below(balanced, balancedFloor)) (balanced = balancedFloor), (held = why)
   }
-  if (v.confidence !== 'high' || neverDown || v.continuation) hold('not sure enough to go lower')
+  if (neverDown || v.continuation) hold('not sure enough to go lower')
+  // With plan limits tight, an unsure Balanced may still go one effort notch lower.
+  else if (v.confidence !== 'high') hold('not sure enough to go lower', tight ? effortNotchDown(ctx.current) : ctx.current)
   if (!ctx.isFirstPrompt && !v.ongoing) hold('one-off aside')
   // A light request inside heavier work is an aside, whatever the judge says of it.
   if (!ctx.isFirstPrompt && tier === 'light' && ctx.previousTier !== 'light') hold('light aside in heavier work')
@@ -227,8 +248,9 @@ export function decide(verdict: Verdict, ctx: PickContext): Decision {
   // A same-model effort step up under 1.5x (Opus medium to high) is not worth a
   // question, except for never-route-down or risky work, and on Sonnet, which
   // gains far more from medium to high.
+  // A continuation of plain deep work is not on that list: it stays as quiet as the work it continues.
   const smallStepUp = (pick: Setup) =>
-    !neverDown && !v.risky && pick.model === 'opus' &&
+    !isNeverDown(v, tier) && pick.model === 'opus' &&
     pick.model === ctx.current.model && weight(pick) > weight(ctx.current) && weight(pick) / weight(ctx.current) < 1.5
   const helps = (pick: Setup) =>
     !(same(pick, ctx.current) && ctx.currentIsLatest !== false) &&

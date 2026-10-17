@@ -35,6 +35,8 @@ export type Turn = { role: 'user' | 'assistant'; text: string }
 
 export type JudgeFacts = {
   isFirstPrompt: boolean
+  // a subagent's task, judged on its own
+  isDelegated?: boolean
   contextTokens: number
   previousTier?: Tier
 }
@@ -109,9 +111,11 @@ export function recentBlock(turns: readonly Turn[]): string {
 
 export function judgeUserMessage(text: string, recent: readonly Turn[], facts: JudgeFacts): string {
   const lines = [
-    facts.isFirstPrompt
-      ? 'Position: first request of a new session.'
-      : `Position: mid-session, conversation about ${Math.round(facts.contextTokens / 1000)}K tokens.`,
+    facts.isDelegated
+      ? 'Position: a task delegated to a helper agent that starts fresh.'
+      : facts.isFirstPrompt
+        ? 'Position: first request of a new session.'
+        : `Position: mid-session, conversation about ${Math.round(facts.contextTokens / 1000)}K tokens.`,
   ]
   if (facts.previousTier) lines.push(`Tier of the work so far: ${facts.previousTier}.`)
   const context = recentBlock(recent)
@@ -186,15 +190,27 @@ export function parseVerdict(reply: string): Verdict | undefined {
   }
 }
 
-// A prompt that names its own model and effort ("Opus 5.5 at high", "Sonnet 5.5,
-// medium effort") has already decided; handoff prompts usually do.
+// A prompt that names its own model and effort has already decided. Chips and
+// plans say so in a line or sentence of its own: "Recommended: Opus 5.5 at high
+// effort.", "Model: Opus 5.5, high effort.", "Model per R34 §3: Sonnet 5.5 at
+// medium." A model named anywhere else is talk about it, not an instruction.
 export function statedSetup(text: string): { model: string; effort: string } | undefined {
-  const m = text.match(/\b(opus|sonnet|haiku|fable)(?:\s+\d(?:\.\d)?)?\s*(?:,\s*|\s+at\s+|\s+)(low|medium|high|xhigh|max)\b/i)
+  const m = text.match(
+    /(?:^|\n|[.!?]\s+)\s*(?:recommended|model)\b[^:\n]{0,80}:\s*(opus|sonnet|haiku|fable)(?:\s+\d(?:\.\d)?)?\s*(?:,\s*|\s+at\s+|\s+)(low|medium|high|xhigh|max)\b/i,
+  )
   return m?.[1] && m[2] ? { model: m[1].toLowerCase(), effort: m[2].toLowerCase() } : undefined
 }
 
-// Short continuations ("ok do it") skip the judge and keep the current setup.
+// Bare continuations ("ok do it", "yes, go ahead") skip the judge and keep the
+// current setup; any other short prompt ("deploy to prod now") is judged.
+const CONTINUATION_WORDS = new Set([
+  'ok', 'okay', 'k', 'yes', 'yep', 'yeah', 'y', 'sure', 'go', 'on', 'ahead', 'continue', 'carry', 'proceed',
+  'do', 'it', 'please', 'thanks', 'thank', 'you', 'next', 'sounds', 'good', 'great', 'perfect', 'fine', 'lgtm',
+  'let', 'lets', 's', 'for', 'that', 'this', 'all', 'right', 'alright', 'cool', 'nice',
+])
 export function isSkippable(text: string): boolean {
   const t = text.trim()
-  return t.length < 25 || /^\/\S+\s*$/.test(t)
+  if (/^\/\S+(?:\s+\S+){0,2}\s*$/.test(t)) return true // a slash command with at most two arguments
+  const words = t.toLowerCase().match(/[a-z]+/g) ?? []
+  return words.length <= 6 && words.every(w => CONTINUATION_WORDS.has(w))
 }

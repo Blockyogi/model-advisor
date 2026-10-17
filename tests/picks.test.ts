@@ -179,6 +179,63 @@ describe('noise', () => {
   })
 })
 
+describe('v2 review fixes (section 3)', () => {
+  test('bug 1: on Opus medium, a failed fix or a production change asks; plain deep work and its continuations stay silent', () => {
+    for (const flags of [['failed_before'], ['production']] as const) {
+      const d = decide(verdict({ tier: 'deep', flags: [...flags], confidence: 'high' }), mid())
+      expect(label(d.best)).toBe('Opus 5.5 · high')
+      expect(d.speak).toBe(true)
+    }
+    expect(decide(verdict({ tier: 'deep', continuation: true, confidence: 'high' }), mid({ previousTier: 'deep' })).speak).toBe(false)
+    expect(decide(verdict({ tier: 'deep', domain: 'legal', continuation: true, confidence: 'high' }), mid({ previousTier: 'deep' })).speak).toBe(true)
+  })
+
+  test('bug 4: mechanical work with an unknown cause, or deeper than standard, keeps its tier', () => {
+    const ci = verdict({ tier: 'standard', mechanical: true, flags: ['unknown_cause'], confidence: 'high' })
+    const d = decide(ci, first())
+    expect(d.tier).toBe('standard')
+    expect(d.best.model).not.toBe('haiku')
+    expect(subagentModel(ci, 'opus')).toBe('opus')
+    expect(decide(verdict({ tier: 'deep', mechanical: true, confidence: 'high' }), first()).tier).toBe('deep')
+  })
+
+  test('bug 6: short commands are judged; only bare continuations skip', () => {
+    for (const t of ['ok', 'yes', 'go on', 'ok do it', 'Yes, go ahead.', 'continue', '/picks log']) expect(isSkippable(t)).toBe(true)
+    for (const t of ['deploy to prod now', 'push it', 'delete the old branch', 'try again']) expect(isSkippable(t)).toBe(false)
+  })
+
+  test('bug 7: in a 900K conversation on Fable, deep work never drops to Fable low', () => {
+    const d = decide(verdict({ tier: 'deep', confidence: 'high' }), mid({ contextTokens: 900_000, current: { model: 'fable', effort: 'high' } }))
+    expect(label(d.best)).toBe('Fable 5.1 · high')
+    expect(d.balanced.effort).not.toBe('low')
+  })
+
+  test('bug 8: a move to a lower model family counts as down, so an unsure verdict holds', () => {
+    const d = decide(verdict({ domain: 'website', confidence: 'medium' }), first({ current: { model: 'opus', effort: 'low' } }))
+    expect(label(d.best)).toBe('Opus 5.5 · low')
+    expect(label(d.balanced)).toBe('Opus 5.5 · low')
+    expect(d.speak).toBe(false)
+  })
+
+  test('bug 9: with the week nearly used, an unsure verdict still gets a Balanced one notch lower', () => {
+    const tight = first({ current: { model: 'opus', effort: 'high' }, limits: { weekly: 92 } })
+    expect(label(decide(verdict({ tier: 'deep', confidence: 'medium' }), tight).balanced)).toBe('Opus 5.5 · medium')
+    expect(label(decide(verdict({ tier: 'deep', domain: 'legal', confidence: 'medium' }), tight).balanced)).toBe('Opus 5.5 · high')
+  })
+
+  test('bug 10: only a Recommended or Model line or sentence names the setup', () => {
+    for (const t of [
+      'check why Opus medium stays silent on legal prompts',
+      'Do you really think this task needs Opus at High effort?',
+      'I selected Fable 5.1 High. After I clicked that, I got the error.',
+    ]) expect(statedSetup(t)).toBe(undefined)
+    expect(statedSetup('Recommended: Opus 5.5 at medium effort.\n\nBuild phase 1.')).toEqual({ model: 'opus', effort: 'medium' })
+    expect(statedSetup('Background.\n\nTask:\nRecommended: Opus 5.5 at xhigh effort (policy reasoning).')).toEqual({ model: 'opus', effort: 'xhigh' })
+    expect(statedSetup('Local commit only. Model: Opus 5.5, high effort.\n\nShared notes')).toEqual({ model: 'opus', effort: 'high' })
+    expect(statedSetup('Build the mod. Recommended model for this session: Opus 5.5 at high effort.')).toEqual({ model: 'opus', effort: 'high' })
+  })
+})
+
 describe('the question', () => {
   test('always three rows, each with its reason, and the switch cost where a model changes', () => {
     const v = verdict({ tier: 'deep', domain: 'legal', flags: ['outside_audience'], confidence: 'high', why: 'notice to an outside party.' })

@@ -42,7 +42,7 @@ Leave it empty and the judge assumes a general mix of work. You can change it la
 | `/picks` | Shows whether the advisor is on and what is running |
 | `/picks clear` | Drops the advisor's pick; requests run on what the picker shows |
 | `/picks off` / `/picks on` | Turns the advisor off or on for this session |
-| `/picks log` | Shows recent judgments and what you chose |
+| `/picks log` | Shows recent judgments, what you chose, questions you dismissed and picks you overrode |
 
 ## How it decides
 
@@ -53,9 +53,9 @@ Leave it empty and the judge assumes a general mix of work. You can change it la
    - Fable is offered only after an earlier attempt failed.
    - In a long conversation, a cheaper model has to pay back its one-time re-read within two prompts, so the advisor prefers an effort change.
    - Balanced gets cheaper as your weekly or 5-hour limit fills up.
-3. It asks only when a change would really help. Small nudges, like Opus medium to Opus high, stay silent.
+3. It asks only when a change would really help. Small nudges, like Opus medium to Opus high, stay silent, except for work that is never routed down (legal letters, tenders, production changes, a failed fix).
 
-If your prompt names its own setup ("Opus 5.5, high"), that becomes Best, and the advisor's own lighter pick is offered as Balanced.
+If your prompt names its own setup in a line or sentence that starts with "Recommended" or "Model" (for example `Recommended: Opus 5.5 at high effort.` or `Model: Opus 5.5, high effort.`), that becomes Best, and the advisor's own lighter pick is offered as Balanced. A model named anywhere else is read as part of the request.
 
 Subagents that have no model of their own are routed without asking, since they start fresh and lose nothing by switching.
 
@@ -64,7 +64,8 @@ Subagents that have no model of their own are routed without asking, since they 
 - **The picker doesn't move.** A mod can't change the model picker in the desktop app, so after you accept a pick, a status line next to the picker shows what is really running, for example `running Opus 5.5 · high (undo: /picks clear)`.
 - **Your prompts stay with you.** The judge runs through your own Claude Code sign-in; nothing is sent anywhere else. It costs about $1 a month of plan usage at heavy use.
 - **It fails open.** If the judge is slow or errors, your prompt runs unchanged.
-- **The log holds no prompt text.** `/picks log` keeps the category, the picks and your choice, so you can see where the advisor over-asks.
+- **Headless runs are skipped.** Prompts in a `claude -p` run are not judged, since no one is there to answer.
+- **The log holds no prompt text.** `/picks log` keeps the category, the picks and your choice, with the session id and prompt number, so you can see where the advisor over-asks.
 
 ## Remove it
 
