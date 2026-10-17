@@ -157,18 +157,48 @@ function keepModelIfSwitchDoesNotPay(pick: Setup, ctx: PickContext, v: Verdict, 
   return s(ctx.current.model, EFFORTS[floor] ?? pick.effort)
 }
 
-// Subagents start fresh (no cache to lose), so they are routed without a
-// question; down from the parent's model only when the judge is sure.
-export function subagentModel(v: Verdict, parent: ModelKey): ModelKey {
-  const tier = v.tier === 'light' && v.flags.length > 0 ? 'standard' : v.tier
-  const pick: ModelKey =
-    isMechanical(v) && !v.risky ? 'haiku'
-    : tier === 'light' ? 'haiku'
-    : tier === 'standard' ? (v.domain === 'code' || v.domain === 'ios' ? 'opus' : 'sonnet')
-    : 'opus'
-  const down = MODEL_WEIGHT[pick] < MODEL_WEIGHT[parent]
-  if (down && (v.confidence !== 'high' || isNeverDown(v, tier))) return parent
-  return pick
+// Subagents are routed by what they are and the job they are given, with no
+// judge call (v2 plan, section 4.6). Types left out here keep their own
+// definition: design-critic runs on Fable, claude-code-guide on Haiku, Plan
+// and the editing agents inherit.
+export type SubagentJob = 'search' | 'review' | 'work'
+const TYPE_JOBS: Record<string, SubagentJob> = {
+  Explore: 'search',
+  'copy-reviewer': 'review',
+  'impeccable-finish-reviewer': 'review',
+}
+// Types with no job of their own, which the brief decides.
+const BRIEFED_TYPES = new Set(['general-purpose', 'claude'])
+
+// A brief frames its job in its opening: "Research task, read-only", "Work
+// read-only in ...", "STRICTLY READ-ONLY". "Do not edit" alone is no sign:
+// writers and editors say it of the files they must leave alone.
+const READ_ONLY = /\bread-only\b/i
+const FRAMING_CHARS = 1000
+// A reviewer's brief opens by naming the reviewer it acts as, or as a read-only review or audit.
+const ACTS_AS_REVIEWER = /copy-reviewer|finish[- ]reviewer/i
+const REVIEW = /\b(?:review|reviewer|reviewing|audit|auditing|critique)\b/i
+const OPENING_CHARS = 300
+
+export function subagentJob(type: string, prompt: string): SubagentJob | undefined {
+  const own = TYPE_JOBS[type]
+  if (own || !BRIEFED_TYPES.has(type)) return own
+  const opening = prompt.slice(0, OPENING_CHARS)
+  const readOnly = READ_ONLY.test(prompt.slice(0, FRAMING_CHARS))
+  if (ACTS_AS_REVIEWER.test(opening) || (readOnly && REVIEW.test(opening))) return 'review'
+  return readOnly ? 'search' : 'work'
+}
+
+// Searches go to Haiku 5.5 medium, reviews to Sonnet 5.5 high (Haiku skips
+// checks, and reviews exist to check), work keeps the parent's model at medium.
+// Inside a never-route-down task every job keeps the parent's setup. `parent`
+// is the advisor's pick the main loop runs; without one the subagent already
+// inherits what its parent runs, so only what changes is set.
+export function subagentRoute(job: SubagentJob, parent: Setup | undefined, inNeverDownTask: boolean): Partial<Setup> {
+  if (inNeverDownTask) return parent ? { ...parent } : {}
+  if (job === 'search') return s('haiku', 'medium')
+  if (job === 'review') return s('sonnet', 'high')
+  return parent ? { model: parent.model, effort: 'medium' } : { effort: 'medium' }
 }
 
 export function decide(verdict: Verdict, ctx: PickContext): Decision {

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 import { isSkippable, parseVerdict, statedSetup, type Verdict } from '../hooks/judge'
-import { decide, label, subagentModel, weight, type PickContext } from '../hooks/picks'
+import { decide, label, subagentJob, subagentRoute, weight, type PickContext } from '../hooks/picks'
 import { questionText, rows } from '../hooks/reasons'
 
 const verdict = (v: Partial<Verdict>): Verdict => ({
@@ -93,12 +93,6 @@ describe('the other rules', () => {
   test('an older-generation session is offered the current one', () => {
     const d = decide(verdict({ tier: 'deep', confidence: 'high' }), first({ current: { model: 'opus', effort: 'high' }, currentIsLatest: false }))
     expect(d.speak).toBe(true)
-  })
-
-  test('subagents: light work goes to Haiku only when the judge is sure', () => {
-    expect(subagentModel(verdict({ tier: 'light', domain: 'admin', confidence: 'high' }), 'opus')).toBe('haiku')
-    expect(subagentModel(verdict({ tier: 'light', domain: 'admin', confidence: 'medium' }), 'opus')).toBe('opus')
-    expect(subagentModel(verdict({ tier: 'deep', domain: 'legal', confidence: 'high' }), 'sonnet')).toBe('opus')
   })
 
   test('the judge reply is read leniently and refused when broken', () => {
@@ -195,7 +189,6 @@ describe('v2 review fixes (section 3)', () => {
     const d = decide(ci, first())
     expect(d.tier).toBe('standard')
     expect(d.best.model).not.toBe('haiku')
-    expect(subagentModel(ci, 'opus')).toBe('opus')
     expect(decide(verdict({ tier: 'deep', mechanical: true, confidence: 'high' }), first()).tier).toBe('deep')
   })
 
@@ -233,6 +226,60 @@ describe('v2 review fixes (section 3)', () => {
     expect(statedSetup('Background.\n\nTask:\nRecommended: Opus 5.5 at xhigh effort (policy reasoning).')).toEqual({ model: 'opus', effort: 'xhigh' })
     expect(statedSetup('Local commit only. Model: Opus 5.5, high effort.\n\nShared notes')).toEqual({ model: 'opus', effort: 'high' })
     expect(statedSetup('Build the mod. Recommended model for this session: Opus 5.5 at high effort.')).toEqual({ model: 'opus', effort: 'high' })
+  })
+})
+
+// Openings of real briefs from the 13 to 17 Oct transcripts (section 4.6, phase 2).
+describe('subagents: routed by type and job, with no judge', () => {
+  const COPY_REVIEW = 'Read ~/.claude/agents/copy-reviewer.md, ignore its frontmatter, follow it exactly, use only Read, Grep and Glob. Channel: X. Draft: /Users/safemode/Desktop/draft.md'
+  const FINISH_REVIEW = 'You are the Impeccable finish reviewer for a finished print document. Read and follow exactly the role file at /Users/safemode/.claude/skills/impeccable/reference/finish.md'
+  const CODE_REVIEW = 'Read-only review; do not edit, commit or push anything. Review the Claude Code mod at /Users/safemode/mods/model-advisor (files: hooks/judge.ts, hooks/picks.ts).'
+  const AUDIT = 'Work in /Users/safemode/Desktop/Claude Code/Claude Optimisation. Read-only audit of Ajay\'s whole Claude Code setup for Task 2.'
+  const RESEARCH = 'Research task, read-only, no files to write. Today is 17 Oct 2026. Use the parallel-search MCP web_search/web_fetch tools first.'
+  const BENCH = 'Bench test, NEW copy stack (house-copy, narrowed review loop of 14 Oct), case 04. Run the house-copy skill end to end, exactly as the main session would.'
+  const WRITER = 'You are one writer in a blind bake-off of X writing stacks. Write X copy for Ajay\'s personal X account for one case, from the brief alone. Do not edit the skill files.'
+  const PATCH = 'Task: apply the approved edits to Ajay\'s local fork of linkedin-skills, as git commits. Do not change anything outside the fork.'
+  const LATE = `You are a research agent. Re-rank skills for writing X hooks. ${'Context on the bench. '.repeat(60)}Earlier shallow clones exist, read-only, under /private/tmp.`
+
+  test('Explore is a search; copy-reviewer and the finish reviewer are reviews', () => {
+    expect(subagentJob('Explore', 'Find every call site of fetchUser')).toBe('search')
+    expect(subagentJob('copy-reviewer', 'Draft: /tmp/x.md')).toBe('review')
+    expect(subagentJob('impeccable-finish-reviewer', 'Review the build')).toBe('review')
+  })
+
+  test('a general-purpose brief that opens as a reviewer, or as a read-only review or audit, is a review', () => {
+    for (const p of [COPY_REVIEW, FINISH_REVIEW, CODE_REVIEW, AUDIT]) expect(subagentJob('general-purpose', p)).toBe('review')
+    expect(subagentJob('claude', CODE_REVIEW)).toBe('review')
+  })
+
+  test('a general-purpose brief that says read-only near its start is a search', () => {
+    expect(subagentJob('general-purpose', RESEARCH)).toBe('search')
+  })
+
+  test('writers, editors and bench arms are work, even when they mention review or say not to edit something', () => {
+    for (const p of [BENCH, WRITER, PATCH, LATE]) expect(subagentJob('general-purpose', p)).toBe('work')
+  })
+
+  test('types with a model or a job of their own are not routed', () => {
+    for (const t of ['design-critic', 'claude-code-guide', 'Plan', 'fork', 'statusline-setup', 'impeccable-documenter'])
+      expect(subagentJob(t, RESEARCH)).toBe(undefined)
+  })
+
+  test('searches go to Haiku 5.5 medium, reviews to Sonnet 5.5 high, work keeps the parent model at medium', () => {
+    const parent = { model: 'opus' as const, effort: 'high' as const }
+    expect(subagentRoute('search', parent, false)).toEqual({ model: 'haiku', effort: 'medium' })
+    expect(subagentRoute('review', parent, false)).toEqual({ model: 'sonnet', effort: 'high' })
+    expect(subagentRoute('work', parent, false)).toEqual({ model: 'opus', effort: 'medium' })
+    // With no pick active the subagent inherits the session's model already.
+    expect(subagentRoute('work', undefined, false)).toEqual({ effort: 'medium' })
+  })
+
+  test('inside a never-route-down task every job keeps the parent setup', () => {
+    const parent = { model: 'opus' as const, effort: 'xhigh' as const }
+    for (const job of ['search', 'review', 'work'] as const) {
+      expect(subagentRoute(job, parent, true)).toEqual(parent)
+      expect(subagentRoute(job, undefined, true)).toEqual({})
+    }
   })
 })
 

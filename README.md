@@ -57,7 +57,14 @@ Leave it empty and the judge assumes a general mix of work. You can change it la
 
 If your prompt names its own setup in a line or sentence that starts with "Recommended" or "Model" (for example `Recommended: Opus 5.5 at high effort.` or `Model: Opus 5.5, high effort.`), that becomes Best, and the advisor's own lighter pick is offered as Balanced. A model named anywhere else is read as part of the request.
 
-Subagents that have no model of their own are routed without asking, since they start fresh and lose nothing by switching.
+Subagents are routed without asking and without a judge call, since they start fresh and lose nothing by switching. Each goes by its type and the job its brief gives it:
+
+- **Searches** (Explore, or a brief that says it is read-only): Haiku 5.5 at medium.
+- **Reviews** (copy-reviewer, the Impeccable finish reviewer, or a read-only review or audit): Sonnet 5.5 at high. Haiku skips checks, and reviews exist to check.
+- **Other work** (general-purpose agents that edit or write): the parent's model, at medium.
+- **Inside a task that is never routed down** (legal, tenders, production changes, a failed fix): the parent's setup, whatever the job.
+
+A call that names its own model or effort keeps it. Other agent types (design-critic and claude-code-guide, which name their own model; Plan; the editing agents of other plugins) run as their definition says.
 
 ## Good to know
 

@@ -35,8 +35,6 @@ export type Turn = { role: 'user' | 'assistant'; text: string }
 
 export type JudgeFacts = {
   isFirstPrompt: boolean
-  // a subagent's task, judged on its own
-  isDelegated?: boolean
   contextTokens: number
   previousTier?: Tier
 }
@@ -111,11 +109,9 @@ export function recentBlock(turns: readonly Turn[]): string {
 
 export function judgeUserMessage(text: string, recent: readonly Turn[], facts: JudgeFacts): string {
   const lines = [
-    facts.isDelegated
-      ? 'Position: a task delegated to a helper agent that starts fresh.'
-      : facts.isFirstPrompt
-        ? 'Position: first request of a new session.'
-        : `Position: mid-session, conversation about ${Math.round(facts.contextTokens / 1000)}K tokens.`,
+    facts.isFirstPrompt
+      ? 'Position: first request of a new session.'
+      : `Position: mid-session, conversation about ${Math.round(facts.contextTokens / 1000)}K tokens.`,
   ]
   if (facts.previousTier) lines.push(`Tier of the work so far: ${facts.previousTier}.`)
   const context = recentBlock(recent)

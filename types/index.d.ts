@@ -17,6 +17,7 @@ declare module 'claude-code' {
       previousTier: AdvisorTier | null
       isOff: boolean
       seenEffort: string | null
+      taskNeverDown: boolean | null
     }
   }
 }

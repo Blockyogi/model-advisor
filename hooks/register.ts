@@ -5,13 +5,15 @@
 import type { EngineInterface, Register, SessionMessage } from 'claude-code'
 import type { AdvisorActive } from '../types'
 import { isSkippable, judgeRequest, parseVerdict, statedSetup, type JudgeFacts, type Turn, type Verdict } from './judge'
-import { decide, isMechanical, label, MODELS, modelKey, subagentModel, type Decision, type Effort, type Limits, type Setup } from './picks'
+import { decide, isMechanical, label, MODELS, modelKey, subagentJob, subagentRoute, type Decision, type Effort, type Limits, type Setup, type SubagentJob } from './picks'
 import { questionText, rows } from './reasons'
 
 const ACTIVE = { plugin: 'model-advisor', key: 'active' } as const
 const PREVIOUS_TIER = { plugin: 'model-advisor', key: 'previousTier' } as const
 const IS_OFF = { plugin: 'model-advisor', key: 'isOff' } as const
 const SEEN_EFFORT = { plugin: 'model-advisor', key: 'seenEffort' } as const
+// Whether the task the main loop is on is never-route-down; its subagents keep the parent's setup.
+const TASK_NEVER_DOWN = { plugin: 'model-advisor', key: 'taskNeverDown' } as const
 
 const JUDGE_TIMEOUT_MS = 6000
 // Each session logs under its own key (`log:<session id>`); `log` holds the
@@ -20,8 +22,6 @@ const LEGACY_LOG_KEY = 'log'
 const LOG_PREFIX = 'log:'
 const SESSION_LOG_MAX = 500
 const SESSION_LOGS_KEPT = 300
-// Subagent types with no model of their own; others keep what their definition says.
-const ROUTED_AGENTS = new Set(['general-purpose', 'claude'])
 const DEFAULT_EFFORT: Record<'haiku' | 'sonnet' | 'opus' | 'fable', Effort> = { haiku: 'medium', sonnet: 'medium', opus: 'medium', fable: 'high' }
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']
 
@@ -30,6 +30,7 @@ type $ = EngineInterface
 type Choice = 'best' | 'balanced' | 'keep' | 'dismissed' | 'no-one-to-ask' | 'silent'
 
 // Fields added on 18 Oct 2026 are optional: older entries lack them.
+// `subagent` entries are from before phase 2, when the judge rated subagents too.
 export type LogEntry = {
   at: string
   kind: 'main' | 'subagent'
@@ -72,7 +73,24 @@ export type LogEvent = {
   to?: string
 }
 
-type LogRow = LogEntry | LogEvent
+// A subagent routed by type and job (v2 phase 2, from 18 Oct 2026).
+export type RouteEntry = {
+  at: string
+  kind: 'route'
+  session?: string
+  turn?: number
+  agent: string
+  job: SubagentJob
+  // inside a never-route-down task, where every job keeps the parent's setup
+  neverDown: boolean
+  // an Agent call a subagent made
+  nested: boolean
+  // what the call was given; absent means inherited
+  model?: string
+  effort?: string
+}
+
+type LogRow = LogEntry | LogEvent | RouteEntry
 
 // Appends run one after another within a session, and each session writes only
 // its own key, so sessions running side by side never overwrite each other.
@@ -201,8 +219,7 @@ function ownWords(text: string): string {
 let about = ''
 
 async function judge($: $, text: string, recent: Turn[], facts: Omit<JudgeFacts, 'previousTier'>, timeoutMs: number) {
-  // A delegated task carries no tier over from the main conversation.
-  const previousTier = facts.isDelegated ? undefined : ((await $.state.get(PREVIOUS_TIER)).value ?? undefined)
+  const previousTier = (await $.state.get(PREVIOUS_TIER)).value ?? undefined
   const started = Date.now()
   const r = await $.model.complete(judgeRequest(text, recent, { ...facts, previousTier }, timeoutMs, about))
   const verdict = r.isAnswered ? parseVerdict(r.text) : undefined
@@ -263,7 +280,10 @@ export const register: Register = (on, options) => {
     const pick = chosen === 'best' ? d.best : chosen === 'balanced' ? d.balanced : undefined
     // Only ongoing work that needs thought sets the tier a later continuation
     // inherits: a push or a quick aside in between leaves it as it was.
-    if (verdict.ongoing && !isMechanical(verdict)) await $.state.set(PREVIOUS_TIER, d.tier)
+    if (verdict.ongoing && !isMechanical(verdict)) {
+      await $.state.set(PREVIOUS_TIER, d.tier)
+      await $.state.set(TASK_NEVER_DOWN, d.neverDown)
+    } else if (d.neverDown) await $.state.set(TASK_NEVER_DOWN, true)
     await appendLog($, entry(verdict, {
       kind: 'main', turn: turns + 1, origin: e.origin.kind, finalTier: d.tier, previousTier, neverDown: d.neverDown, limits,
       first: isFirstPrompt, contextK: Math.round(contextTokens / 1000), current: label(current),
@@ -296,6 +316,7 @@ export const register: Register = (on, options) => {
   on('session.end', async ($, e, next) => {
     if (e.reason === 'clear') {
       await $.state.set(PREVIOUS_TIER, null)
+      await $.state.set(TASK_NEVER_DOWN, null)
       await $.state.set(ACTIVE, null)
       await showStatus($)
     }
@@ -326,23 +347,25 @@ export const register: Register = (on, options) => {
     return yield* next({ ...e, model: MODELS[active.model], effort: active.effort })
   })
 
-  // Subagents start fresh, so they are routed without a question, each judged
-  // as a task of its own against what the main loop really runs.
-  on('agent.spawn', async ($, e, next) => {
-    if (e.fork || e.isTeammate || e.workflow || e.model !== undefined || !ROUTED_AGENTS.has(e.subagentType)) return next(e)
-    if ((await $.state.get(IS_OFF)).value) return next(e)
-    const inherited = modelKey(e.parentModel) ?? 'opus'
-    const { value: active } = await $.state.get(ACTIVE)
-    const parent = (e.parentAgentId === undefined ? active?.model : undefined) ?? inherited
-    const { verdict, ms } = await judge($, e.prompt, [], { isFirstPrompt: true, contextTokens: 0, isDelegated: true }, 5000)
-    if (!verdict) return next(e)
-    const pick = subagentModel(verdict, parent)
-    await appendLog($, entry(verdict, {
-      kind: 'subagent', turn: await $.session.turns(), first: true, contextK: 0, current: parent, best: pick,
-      chosen: pick === parent ? 'kept' : 'routed', judgeMs: ms,
-    }))
-    // A subagent with no model of its own inherits the session's, not the pick.
-    return pick === inherited ? next(e) : next({ ...e, model: MODELS[pick] })
+  // Subagents start fresh, so a switch costs no re-read: they are routed by
+  // type and job with no question and no judge call. The Agent tool takes an
+  // effort as well as a model (agent.spawn can set only the model), so the
+  // route is written into the call. A call that names either has decided.
+  on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
+    if (e.model !== undefined || e.effort !== undefined) return next(e)
+    const agent = e.subagent_type ?? 'general-purpose'
+    const job = subagentJob(agent, e.prompt)
+    if (!job || (await $.state.get(IS_OFF)).value) return next(e)
+    const [{ value: active }, { value: neverDown }] = await Promise.all([$.state.get(ACTIVE), $.state.get(TASK_NEVER_DOWN)])
+    // The main loop runs the advisor's pick, which a subagent would not inherit;
+    // a subagent's own Agent calls inherit what that subagent runs.
+    const nested = e.agentId !== undefined
+    const parent = !nested && active ? { model: active.model, effort: active.effort } : undefined
+    const route = subagentRoute(job, parent, neverDown === true)
+    await appendLog($, {
+      at: new Date().toISOString(), kind: 'route', turn: await $.session.turns(), agent, job, neverDown: neverDown === true, nested, ...route,
+    })
+    return next({ ...e, ...route })
   })
 
   on('command.run', { command: 'picks' }, async ($, e) => {
@@ -383,7 +406,8 @@ async function logText($: $): Promise<string> {
   const log = await readLog($)
   if (log.length === 0) return 'No picks logged yet.'
   const main = log.filter((x): x is LogEntry => x.kind === 'main')
-  const subagents = log.filter((x): x is LogEntry => x.kind === 'subagent')
+  const routes = log.filter((x): x is RouteEntry => x.kind === 'route')
+  const routed = (job: SubagentJob) => routes.filter(x => !x.neverDown && x.job === job).length
   const count = (c: string) => main.filter(x => x.chosen === c).length
   const events = (event: LogEvent['event']) => log.filter(x => x.kind === 'event' && x.event === event).length
   const asked = main.length - count('silent')
@@ -391,6 +415,8 @@ async function logText($: $): Promise<string> {
     const when = x.at.slice(5, 16).replace('T', ' ')
     if (x.kind === 'event')
       return `${when}  ${x.event === 'picks-clear' ? `/picks clear dropped ${x.from}` : `picker changed: ${x.from} -> ${x.to ?? '?'}`}`
+    if (x.kind === 'route')
+      return `${when}  subagent ${x.agent} (${x.neverDown ? 'never-route-down task' : x.job}) -> ${x.model ?? 'inherited'} · ${x.effort ?? 'inherited'}`
     const what = `${x.finalTier ?? x.tier}/${x.domain}${x.continuation ? ' (continues)' : ''}`
     const pick = x.kind === 'subagent'
       ? `subagent ${x.current} -> ${x.best} (${x.chosen})`
@@ -402,8 +428,9 @@ async function logText($: $): Promise<string> {
   return [
     `${main.length} prompts judged, asked on ${asked}: Best ${count('best')}, Balanced ${count('balanced')}, Keep ${count('keep')}, ` +
       `dismissed ${count('dismissed')}, no one to ask ${count('no-one-to-ask')}.`,
-    `After a pick you changed the picker ${events('picker-change')} times and used /picks clear ${events('picks-clear')} times. ` +
-      `${subagents.length} subagents judged, ${subagents.filter(x => x.chosen === 'routed').length} routed.`,
+    `After a pick you changed the picker ${events('picker-change')} times and used /picks clear ${events('picks-clear')} times.`,
+    `${routes.length} subagents routed by type: ${routed('search')} search, ${routed('review')} review, ${routed('work')} work, ` +
+      `${routes.filter(x => x.neverDown).length} kept on the parent.`,
     ...lines,
   ].join('\n')
 }

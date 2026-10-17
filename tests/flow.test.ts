@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
-import type { ModelCompleteResult, On, TurnStepInput } from 'claude-code'
+import type { ModelCompleteResult, On, ToolCallInput, TurnStepInput } from 'claude-code'
 
 const usage = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 const deepLegal = JSON.stringify({
@@ -15,7 +15,7 @@ const reply = (v: object): ModelCompleteResult => ({ isAnswered: true, text: JSO
 
 type World = {
   asked: string[][]; descriptions: string[][]; logs: string[]; toasts: string[]; status: (string | undefined)[]
-  seen: TurnStepInput[]; judged: number; systems: string[]; prompts: string[]
+  seen: TurnStepInput[]; judged: number; systems: string[]; prompts: string[]; agents: ToolCallInput[]
   model: string; rows: { role: 'user' | 'assistant'; text: string }[]; surfaces: string[]; store: Map<string, unknown>
 }
 
@@ -25,7 +25,7 @@ function session(
   env: Record<string, string> = { CLAUDE_CODE_ENTRYPOINT: 'claude-desktop' },
 ): World {
   const w: World = {
-    asked: [], descriptions: [], logs: [], toasts: [], status: [], seen: [], judged: 0, systems: [], prompts: [],
+    asked: [], descriptions: [], logs: [], toasts: [], status: [], seen: [], judged: 0, systems: [], prompts: [], agents: [],
     model: 'claude-sonnet-5-5', rows: [], surfaces: ['desktop'], store: new Map(),
   }
   // The plugin's store, kept here so a test can read what was logged.
@@ -55,7 +55,8 @@ function session(
     if (choice === null) return { deny: 'dismissed' }
     return { result: { questions: e.questions, answers: { [q.question]: choice } } }
   })
-  on('agent.spawn', (_$, e) => ({ model: e.model ?? 'inherit', agentId: 'a1' }) as never)
+  // The Agent call as it reaches the tool, after the plugin's rewrite.
+  on('tool.call', { tool: 'Agent' }, (_$, e) => (w.agents.push(e), { deny: 'the test stops here' }))
   on('command.run', () => ({ text: 'unanswered' }))
   on('prompt.submit', (_$, e) => ({ text: e.text }))
   on('turn.step', async function* (_$, e) {
@@ -186,7 +187,6 @@ describe('v2 review fixes (section 3) and the log (section 4.8)', () => {
   const deepCode = { tier: 'deep', domain: 'code', flags: ['many_sources'], risky: false, mechanical: false, continuation: false, ongoing: true, confidence: 'high', why: 'multi-file refactor' }
   const push = { tier: 'light', domain: 'code', flags: [], risky: false, mechanical: true, continuation: false, ongoing: true, confidence: 'high', why: 'git push' }
   const nextStep = { tier: 'light', domain: 'code', flags: [], risky: false, mechanical: false, continuation: true, ongoing: true, confidence: 'high', why: 'next step' }
-  const lookup = { tier: 'standard', domain: 'code', flags: [], risky: false, mechanical: false, continuation: false, ongoing: true, confidence: 'high', why: 'find call sites' }
 
   test('bug 2: a dismissed question is logged as dismissed, not Keep', async ($, on) => {
     session(on, () => null)
@@ -238,16 +238,6 @@ describe('v2 review fixes (section 3) and the log (section 4.8)', () => {
     expect(w.status.at(-1)).toBe(undefined)
   })
 
-  test('bug 12: a subagent is judged fresh and routed against the active pick', async ($, on) => {
-    const w = session(on, labels => labels[0]!, n => (n === 1 ? answered() : reply(lookup)))
-    await $.prompt.submit({ text: NOTICE, ...composer })
-    const r = await $.agent.spawn({ prompt: 'Find every call site of fetchUser and list them', subagentType: 'general-purpose', parentModel: 'claude-sonnet-5-5', fork: false, background: false } as never)
-    expect(w.prompts[1]).not.toContain('Tier of the work so far')
-    expect(w.prompts[1]).toContain('delegated')
-    expect((r as { model?: string }).model).toBe('claude-opus-5-5')
-    expect(await picks($, 'log')).toContain('1 subagents judged, 0 routed')
-  })
-
   test('bug 13: entries go under the session\'s own key, and concurrent ones are all kept', async ($, on) => {
     const w = session(on, labels => labels.at(-1)!)
     await Promise.all([1, 2, 3].map(() => $.prompt.submit({ text: NOTICE, ...composer })))
@@ -264,5 +254,101 @@ describe('v2 review fixes (section 3) and the log (section 4.8)', () => {
       session: 'session-1', turn: 2, tier: 'frontier', finalTier: 'deep', neverDown: false,
       risky: false, mechanical: false, limits: {},
     })
+  })
+})
+
+describe('v2 phase 2: subagents routed by type and job (section 4.6)', () => {
+  const deepCode = reply({ tier: 'deep', domain: 'code', flags: ['many_sources'], risky: false, mechanical: false, continuation: false, ongoing: true, confidence: 'high', why: 'multi-file refactor' })
+  const REFACTOR = 'Refactor the sync engine across the five services so retries are idempotent.'
+  const SEARCH = 'Find every call site of fetchUser and list them with file and line.'
+  const call = ($: Engine, subagentType: string | undefined, prompt: string, extra: Record<string, string> = {}) =>
+    $.tool.call({ tool: 'Agent', description: 'a task', prompt, ...(subagentType ? { subagent_type: subagentType } : {}), ...extra } as never)
+  const sent = (w: World) => {
+    const a = w.agents.at(-1) as { model?: string; effort?: string } | undefined
+    return [a?.model, a?.effort]
+  }
+
+  test('Explore runs on Haiku 5.5 at medium, with no judge call', async ($, on) => {
+    const w = session(on, labels => labels[0]!)
+    await call($, 'Explore', SEARCH)
+    expect(sent(w)).toEqual(['haiku', 'medium'])
+    expect(w.judged).toBe(0)
+  })
+
+  test('a general-purpose read-only search runs on Haiku 5.5 at medium', async ($, on) => {
+    const w = session(on, labels => labels[0]!)
+    await call($, undefined, 'Research task, read-only, no files to write. Find what changed in Claude Code 2.1.300.')
+    expect(sent(w)).toEqual(['haiku', 'medium'])
+  })
+
+  test('reviewers that read and report run on Sonnet 5.5 at high', async ($, on) => {
+    const w = session(on, labels => labels[0]!)
+    await call($, 'copy-reviewer', 'Draft: /tmp/draft.md. Brand file: /tmp/brand.md.')
+    expect(sent(w)).toEqual(['sonnet', 'high'])
+    await call($, 'general-purpose', 'Read ~/.claude/agents/copy-reviewer.md, ignore its frontmatter, follow it exactly. Draft: /tmp/x.md')
+    expect(sent(w)).toEqual(['sonnet', 'high'])
+  })
+
+  test('a general-purpose agent that edits keeps the parent model, at medium', async ($, on) => {
+    const w = session(on, labels => labels[0]!, () => deepCode)
+    await call($, 'general-purpose', REFACTOR)
+    expect(sent(w)).toEqual([undefined, 'medium'])
+    await $.prompt.submit({ text: REFACTOR, ...composer })
+    expect(w.asked[0]![0]).toBe('Best: Opus 5.5 · high')
+    await call($, 'general-purpose', REFACTOR)
+    expect(sent(w)).toEqual(['opus', 'medium'])
+  })
+
+  test('inside a never-route-down task a subagent keeps the parent setup', async ($, on) => {
+    const w = session(on, labels => labels[0]!)
+    await $.prompt.submit({ text: NOTICE, ...composer })
+    await call($, 'Explore', SEARCH)
+    expect(sent(w)).toEqual(['opus', 'high'])
+  })
+
+  test('inside a never-route-down task with no pick, a subagent inherits the session as it is', async ($, on) => {
+    const w = session(on, labels => labels.at(-1)!)
+    await $.prompt.submit({ text: NOTICE, ...composer })
+    await call($, 'copy-reviewer', 'Draft: /tmp/notice.md')
+    expect(sent(w)).toEqual([undefined, undefined])
+  })
+
+  test('/clear ends the never-route-down task', async ($, on) => {
+    const w = session(on, labels => labels.at(-1)!)
+    await $.prompt.submit({ text: NOTICE, ...composer })
+    await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
+    await call($, 'Explore', SEARCH)
+    expect(sent(w)).toEqual(['haiku', 'medium'])
+  })
+
+  test('a call that names its own model or effort is left as it is', async ($, on) => {
+    const w = session(on, labels => labels[0]!)
+    await call($, 'Explore', SEARCH, { model: 'sonnet' })
+    expect(sent(w)).toEqual(['sonnet', undefined])
+    await call($, 'Explore', SEARCH, { effort: 'low' })
+    expect(sent(w)).toEqual([undefined, 'low'])
+  })
+
+  test('agent types with a model or job of their own are left as they are', async ($, on) => {
+    const w = session(on, labels => labels[0]!)
+    for (const t of ['design-critic', 'claude-code-guide', 'Plan', 'fork']) {
+      await call($, t, SEARCH)
+      expect(sent(w)).toEqual([undefined, undefined])
+    }
+  })
+
+  test('/picks off leaves subagents as Claude Code sets them', async ($, on) => {
+    const w = session(on, labels => labels[0]!)
+    await picks($, 'off')
+    await call($, 'Explore', SEARCH)
+    expect(sent(w)).toEqual([undefined, undefined])
+  })
+
+  test('each route is logged and counted in /picks log', async ($, on) => {
+    const w = session(on, labels => labels[0]!)
+    await call($, 'Explore', SEARCH)
+    const [row] = w.store.get('log:session-1') as Record<string, unknown>[]
+    expect(row).toMatchObject({ kind: 'route', agent: 'Explore', job: 'search', model: 'haiku', effort: 'medium', session: 'session-1' })
+    expect(await picks($, 'log')).toContain('1 subagents routed by type: 1 search, 0 review, 0 work, 0 kept on the parent')
   })
 })
