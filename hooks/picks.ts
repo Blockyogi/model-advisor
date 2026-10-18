@@ -347,7 +347,9 @@ export function decide(verdict: Verdict, ctx: PickContext): Decision {
 // question, except for never-route-down or risky work, and on Sonnet, which
 // gains far more from medium to high.
 // A continuation of plain deep work is not on that list: it stays as quiet as the work it continues.
+// When Best is the current setup, the setup already fits: a cheaper Balanced alone never asks.
 function speaks(best: Setup, balanced: Setup, v: Verdict, tier: Tier, ctx: PickContext): boolean {
+  if (same(best, ctx.current) && ctx.currentIsLatest !== false) return false
   const smallStepUp = (pick: Setup) =>
     !isNeverDown(v, tier) && pick.model === 'opus' &&
     pick.model === ctx.current.model && weight(pick) > weight(ctx.current) && weight(pick) / weight(ctx.current) < 1.5

@@ -64,7 +64,7 @@ work: at most 12 words on what the assistant must now do, e.g. "rerun the failin
 continuation: true when the request mainly approves, answers or reports status so the assistant can carry on the work in the recent turns. A new task that only refers back ("the same way", "like the last one") is false.
 
 action: the main thing the assistant must do now, one of:
-- ship: carry out an act already decided, with no real thinking: push, merge, run a known command, install or launch a build, schedule or send text already written and approved, rename or move files. A job that needs choices along the way (cleaning up an inbox, sorting folders) is edit or build; one that needs text written first is draft.
+- ship: carry out an act already decided, with no real thinking: push, merge, run a known command, install or launch a build, schedule or send text already written and approved, rename or move files, rename a variable or function to a name the request gives. A job that needs choices along the way (cleaning up an inbox, sorting folders) is edit or build; one that needs text written first is draft.
 - lookup: find and report a fact at hand, or answer a quick question: a status, a figure, a file, a setting, how to do a known thing, what a term means.
 - answer: advise, recommend or judge by reasoning over what is known.
 - edit: change something that exists, as the person specified: a line, a setting, a form, an earlier draft per their notes.
@@ -100,6 +100,8 @@ ongoing: true when this starts or continues a task likely to span several more r
 Examples (action, scope, novelty, flags):
 - what does HTTP 429 mean: lookup, one, known.
 - rename 40 screenshots to date order: ship, one, known.
+- rename the variable userId to accountId in this snippet: ship, one, known.
+- rename getUser to fetchUser across the codebase: ship, many, known.
 - "push it" after the changes were approved: ship, one, known; continuation.
 - fix the "Contcat" typo in the footer: edit, one, known; checkable.
 - add a validated contact form to the Next.js site: build, few, known.

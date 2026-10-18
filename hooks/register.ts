@@ -160,6 +160,16 @@ async function endPick($: $, active: AdvisorActive, event: LogEvent['event'], to
   await appendLog($, { at: new Date().toISOString(), kind: 'event', event, turn: await $.session.turns(), from: label(active), to })
 }
 
+// The effort the session was started with: the desktop app passes the picker's
+// as `--effort` to the Claude Code process, and a terminal user may too. A
+// command the mod runs is that process's child, so `ps` reads it there. Where
+// `ps` is missing (Windows) or no flag was given, nothing is known.
+function launchEffort($: $): Promise<string | undefined> {
+  return $.process.run(['/bin/sh', '-c', 'ps -o args= -p "$PPID"'], { timeoutMs: 2000 })
+    .then(r => /(?:^|\s)--effort[= ](low|medium|high|xhigh|max)\b/.exec(r.stdout)?.[1])
+    .catch(() => undefined)
+}
+
 // The setup the next request will run on: the sticky pick, else the picker's.
 // A model change in the picker since the pick took hold ends the pick here,
 // before judging, so the prompt is judged against what will really run.
@@ -171,8 +181,11 @@ async function currentSetup($: $): Promise<{ setup: Setup; isLatest: boolean }> 
   // An alias (`opus`) names the latest; a dated id must be one of ours.
   const isLatest = !/\d/.test(id) || Object.values(MODELS).some(m => id.startsWith(m))
   const { value: seen } = await $.state.get(SEEN_EFFORT)
+  // Before the session's first request the advisor has seen no effort yet; the
+  // picker's is then the session's own --effort flag, which settings.json does not hold.
+  const launched = seen ? undefined : await launchEffort($)
   const configured = ((await $.settings.read()) as { effortLevel?: string }).effortLevel
-  const effort = [seen, configured].find((x): x is Effort => !!x && EFFORTS.includes(x)) ?? DEFAULT_EFFORT[model]
+  const effort = [seen, launched, configured].find((x): x is Effort => !!x && EFFORTS.includes(x)) ?? DEFAULT_EFFORT[model]
   if (active) await endPick($, active, 'picker-change', label({ model, effort }))
   return { setup: { model, effort }, isLatest }
 }

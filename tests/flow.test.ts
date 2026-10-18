@@ -20,6 +20,8 @@ type World = {
   seen: TurnStepInput[]; judged: number; systems: string[]; prompts: string[]; agents: ToolCallInput[]
   model: string; rows: (Omit<SessionMessage, 'toolUses'> & { toolUses?: SessionMessage['toolUses'] })[]
   surfaces: string[]; store: Map<string, unknown>
+  // the session's own command line, as `ps` reports it
+  launchArgs: string
 }
 
 // `answer` returns null to dismiss the question.
@@ -29,7 +31,7 @@ function session(
 ): World {
   const w: World = {
     asked: [], descriptions: [], logs: [], toasts: [], status: [], seen: [], judged: 0, systems: [], prompts: [], agents: [],
-    model: 'claude-sonnet-5-5', rows: [], surfaces: ['desktop'], store: new Map(),
+    model: 'claude-sonnet-5-5', rows: [], surfaces: ['desktop'], store: new Map(), launchArgs: 'claude',
   }
   // The plugin's store, kept here so a test can read what was logged.
   on('store.get', (_$, e) => ({ value: w.store.get(e.key) }))
@@ -45,6 +47,7 @@ function session(
   on('session.end', (_$, e) => ({ sessionId: e.sessionId }) as never)
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1_000_000, tokens: 0 }, rateLimits: [] } }))
   on('settings.read', () => ({ value: { effortLevel: 'medium' } }))
+  on('process.run', () => ({ value: { exitCode: 0, stdout: `${w.launchArgs}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
   on('model.complete', (_$, e) => ((w.judged += 1), w.systems.push(e.system ?? ''), w.prompts.push(e.prompt), { value: judge(w.judged) }))
   on('ui.status', (_$, e) => (w.status.push(e.text), { value: undefined }))
   on('ui.toast', (_$, e) => (w.toasts.push(e.text), { value: undefined }))
@@ -459,5 +462,35 @@ describe('v2 phase 5: a step up when an attempt fails (4.3)', () => {
     await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
     await $.prompt.submit({ text: 'Still broken.', ...composer })
     expect((w.store.get('log:session-1') as Record<string, unknown>[]).at(-1)?.failures).toBe(1)
+  })
+})
+
+describe('the effort the session was started with', () => {
+  // The desktop app starts each session's CLI with the picker's model and effort as flags.
+
+  test('the first prompt is judged against the effort the picker set, not the settings file', async ($, on) => {
+    const w = session(on, labels => labels[0]!)
+    w.launchArgs = '/Applications/claude --output-format stream-json --effort=xhigh --model=claude-opus-5-5'
+    w.model = 'claude-opus-5-5'
+    await $.prompt.submit({ text: NOTICE, ...composer })
+    expect(w.asked).toEqual([])
+    const [entry] = w.store.get('log:session-1') as Record<string, unknown>[]
+    expect(entry).toMatchObject({ current: 'Opus 5.5 · xhigh' })
+  })
+
+  test('with no effort flag, or no way to read it, the settings file still counts', async ($, on) => {
+    const w = session(on, labels => labels[0]!)
+    w.launchArgs = '/usr/local/bin/claude --model opus'
+    w.model = 'claude-opus-5-5'
+    await $.prompt.submit({ text: NOTICE, ...composer })
+    expect((w.store.get('log:session-1') as Record<string, unknown>[])[0]).toMatchObject({ current: 'Opus 5.5 · medium' })
+  })
+
+  test('once a request has been seen, its effort wins over the flag', async ($, on) => {
+    const w = session(on, labels => labels.at(-1)!)
+    w.launchArgs = 'claude --effort=xhigh'
+    await step($, w, 0, 'claude-sonnet-5-5', 'high')
+    await $.prompt.submit({ text: NOTICE, ...composer })
+    expect((w.store.get('log:session-1') as Record<string, unknown>[])[0]).toMatchObject({ current: 'Sonnet 5.5 · high' })
   })
 })

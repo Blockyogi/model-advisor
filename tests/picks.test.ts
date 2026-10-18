@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 import {
-  isSkippable, judgeUserMessage, parseVerdict, recentBlock, reportsFailure, statedSetup, summarizeTurns, turnFailure,
+  isSkippable, judgeUserMessage, parseVerdict, recentBlock, reportsFailure, rubric, statedSetup, summarizeTurns, turnFailure,
   type MessageRow, type Verdict,
 } from '../hooks/judge'
 import { agree, decide, DISAGREE, isMechanical, label, movesDown, stepUp, subagentJob, subagentRoute, tierOf, weight, type PickContext } from '../hooks/picks'
@@ -569,5 +569,32 @@ describe('phase 5: a step up when an attempt fails (4.3)', () => {
 describe('phase 5: the light-call gap (section 11)', () => {
   test('a one-item lookup that continues the work still carries it: status replies look like lookups to the judge', () => {
     expect(decide(light({ continuation: true }), mid({ previousTier: 'deep' })).tier).toBe('deep')
+  })
+})
+
+describe('when the setup already fits, it stays silent', () => {
+  // "Rename the variable cnt to count in this snippet", 18 Oct, on Opus 5.5 medium: the judge called it an
+  // edit of one known, checkable thing, so standard; Best was Keep and only Balanced (Opus low) differed.
+  test('Best equal to Keep never asks, however much a cheaper Balanced would save', () => {
+    const v = verdict({ action: 'edit', scope: 'one', ongoing: false })
+    for (const ctx of [first(), first({ limits: { weekly: 90 } }), mid({ previousTier: 'standard' })]) {
+      const d = decide(v, ctx)
+      expect(label(d.best)).toBe('Opus 5.5 · medium')
+      expect(d.speak).toBe(false)
+      expect(agree(d, d, v, ctx).speak).toBe(false)
+    }
+  })
+
+  test('a Best other than Keep still asks', () => {
+    expect(decide(verdict({ domain: 'website' }), first({ current: { model: 'sonnet', effort: 'medium' } })).speak).toBe(true)
+    expect(decide(verdict({ domain: 'website' }), first({ current: { model: 'opus', effort: 'medium' }, currentIsLatest: false })).speak).toBe(true)
+  })
+
+  test('renaming a variable or function to a name the request gives is ship, so light', () => {
+    expect(rubric('')).toMatch(/- ship:[^\n]*rename a variable or function/)
+    expect(rubric('')).toMatch(/\n- rename the variable \w+ to \w+ in this snippet: ship, one, known\./)
+    const d = decide(verdict({ action: 'ship', scope: 'one', ongoing: false }), first())
+    expect(d.tier).toBe('light')
+    expect(label(d.best)).toBe('Sonnet 5.5 · low')
   })
 })
