@@ -56,6 +56,7 @@ Leave it empty and the judge assumes a general mix of work. You can change it la
    - In a long conversation, a cheaper model has to pay back its one-time re-read within two prompts, so the advisor prefers an effort change.
    - Balanced gets cheaper as your weekly or 5-hour limit fills up.
 3. It asks only when a change would really help. Small nudges, like Opus medium to Opus high, stay silent, except for work that is never routed down (legal letters, tenders, production changes, public copy, a failed fix).
+4. When an attempt fails, it offers a step up. It counts a failure when you say so ("still broken", "didn't work", "same error", "try again"). It also counts one when the turn before ended with tests still failing or a command failing after an edit, and your next prompt carries on that work. The first offer keeps your model and raises the effort one step, so nothing is re-read. If the next prompt shows a failure too, it offers a model step: Sonnet to Opus at high, Opus to xhigh, then Fable, never for research.
 
 If your prompt names its own setup in a line or sentence that starts with "Recommended" or "Model" (for example `Recommended: Opus 5.5 at high effort.` or `Model: Opus 5.5, high effort.`), that becomes Best, and the advisor's own lighter pick is offered as Balanced. A model named anywhere else is read as part of the request.
 
