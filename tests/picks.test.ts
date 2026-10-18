@@ -573,8 +573,8 @@ describe('phase 5: the light-call gap (section 11)', () => {
 })
 
 describe('when the setup already fits, it stays silent', () => {
-  // "Rename the variable cnt to count in this snippet", 18 Oct, on Opus 5.5 medium: the judge called it an
-  // edit of one known, checkable thing, so standard; Best was Keep and only Balanced (Opus low) differed.
+  // A request to rename one variable in a snippet, on Opus 5.5 medium: the judge called it an edit of
+  // one known, checkable thing, so standard; Best was Keep and only Balanced (Opus low) differed.
   test('Best equal to Keep never asks, however much a cheaper Balanced would save', () => {
     const v = verdict({ action: 'edit', scope: 'one', ongoing: false })
     for (const ctx of [first(), first({ limits: { weekly: 90 } }), mid({ previousTier: 'standard' })]) {
