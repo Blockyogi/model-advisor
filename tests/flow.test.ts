@@ -1,12 +1,14 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
-import type { ModelCompleteResult, On, ToolCallInput, TurnStepInput } from 'claude-code'
+import type { ModelCompleteResult, On, SessionMessage, ToolCallInput, TurnStepInput } from 'claude-code'
 
 const usage = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
-const deepLegal = JSON.stringify({
-  tier: 'deep', domain: 'legal', flags: ['outside_audience'], risky: false,
-  continuation: false, ongoing: true, confidence: 'high', why: 'legal notice to a builder',
+// The judge's facts (phase 4): what the work is, not how hard.
+const facts = (v: object) => ({
+  work: '', continuation: false, action: 'build', scope: 'few', novelty: 'known', checkable: true,
+  flags: [], risky: false, domain: 'code', ongoing: true, ...v,
 })
+const deepLegal = JSON.stringify(facts({ work: 'legal notice to a builder', action: 'draft', scope: 'one', domain: 'legal', flags: ['outside_audience'] }))
 const NOTICE = 'Draft the RERA legal notice to the builder for delayed possession.'
 const composer = { wait: false, origin: { kind: 'composer' as const } }
 
@@ -16,7 +18,8 @@ const reply = (v: object): ModelCompleteResult => ({ isAnswered: true, text: JSO
 type World = {
   asked: string[][]; descriptions: string[][]; logs: string[]; toasts: string[]; status: (string | undefined)[]
   seen: TurnStepInput[]; judged: number; systems: string[]; prompts: string[]; agents: ToolCallInput[]
-  model: string; rows: { role: 'user' | 'assistant'; text: string }[]; surfaces: string[]; store: Map<string, unknown>
+  model: string; rows: (Omit<SessionMessage, 'toolUses'> & { toolUses?: SessionMessage['toolUses'] })[]
+  surfaces: string[]; store: Map<string, unknown>
 }
 
 // `answer` returns null to dismiss the question.
@@ -35,7 +38,7 @@ function session(
   on('store.keys', () => ({ value: [...w.store.keys()] }))
   mock.env(on, env)
   on('session.model', () => ({ value: w.model }))
-  on('session.messages', () => ({ value: w.rows.map(r => ({ ...r, toolUses: [] })) }))
+  on('session.messages', () => ({ value: w.rows.map(r => ({ toolUses: [], ...r })) }))
   on('session.id', () => ({ value: 'session-1' }))
   on('session.turns', () => ({ value: w.rows.filter(r => r.role === 'user').length }))
   on('session.surfaces', () => ({ value: w.surfaces as never }))
@@ -184,9 +187,9 @@ test('a prompt that is only an app reminder is skipped', async ($, on) => {
 })
 
 describe('v2 review fixes (section 3) and the log (section 4.8)', () => {
-  const deepCode = { tier: 'deep', domain: 'code', flags: ['many_sources'], risky: false, mechanical: false, continuation: false, ongoing: true, confidence: 'high', why: 'multi-file refactor' }
-  const push = { tier: 'light', domain: 'code', flags: [], risky: false, mechanical: true, continuation: false, ongoing: true, confidence: 'high', why: 'git push' }
-  const nextStep = { tier: 'light', domain: 'code', flags: [], risky: false, mechanical: false, continuation: true, ongoing: true, confidence: 'high', why: 'next step' }
+  const deepCode = facts({ work: 'multi-file refactor', scope: 'many' })
+  const push = facts({ work: 'git push', action: 'ship', scope: 'one' })
+  const nextStep = facts({ work: 'next step', scope: 'one', continuation: true })
 
   test('bug 2: a dismissed question is logged as dismissed, not Keep', async ($, on) => {
     session(on, () => null)
@@ -215,7 +218,7 @@ describe('v2 review fixes (section 3) and the log (section 4.8)', () => {
     w.rows = [{ role: 'user', text: 'Refactor the sync engine' }, { role: 'assistant', text: 'Done with step 2.' }]
     await $.prompt.submit({ text: 'commit and push this to the branch now', ...composer })
     await $.prompt.submit({ text: 'carry on with step 3 of the plan please', ...composer })
-    expect(w.prompts[2]).toContain('Tier of the work so far: deep.')
+    expect(w.prompts[2]).toContain('The work so far was rated deep.')
   })
 
   test('bug 5: a model change in the picker counts before the next prompt is judged, and is logged', async ($, on) => {
@@ -246,19 +249,21 @@ describe('v2 review fixes (section 3) and the log (section 4.8)', () => {
   })
 
   test('4.8: each entry carries session, turn, final tier, floor, limits and the judge facts', async ($, on) => {
-    const w = session(on, labels => labels[0]!, () => reply({ ...deepCode, flags: [], tier: 'frontier' }))
+    const w = session(on, labels => labels[0]!, () => reply({ ...deepCode, novelty: 'new' }))
     w.rows = [{ role: 'user', text: 'earlier prompt' }]
     await $.prompt.submit({ text: 'Rewrite the sync engine from scratch across every service.', ...composer })
     const [entry] = w.store.get('log:session-1') as Record<string, unknown>[]
     expect(entry).toMatchObject({
-      session: 'session-1', turn: 2, tier: 'frontier', finalTier: 'deep', neverDown: false,
-      risky: false, mechanical: false, limits: {},
+      session: 'session-1', turn: 2, finalTier: 'deep', action: 'build', scope: 'many', novelty: 'new', checkable: true,
+      neverDown: false, risky: false, mechanical: false, limits: {},
     })
+    expect(entry).not.toHaveProperty('tier')
+    expect(entry).not.toHaveProperty('agreed')
   })
 })
 
 describe('v2 phase 2: subagents routed by type and job (section 4.6)', () => {
-  const deepCode = reply({ tier: 'deep', domain: 'code', flags: ['many_sources'], risky: false, mechanical: false, continuation: false, ongoing: true, confidence: 'high', why: 'multi-file refactor' })
+  const deepCode = reply(facts({ work: 'multi-file refactor', scope: 'many' }))
   const REFACTOR = 'Refactor the sync engine across the five services so retries are idempotent.'
   const SEARCH = 'Find every call site of fetchUser and list them with file and line.'
   const call = ($: Engine, subagentType: string | undefined, prompt: string, extra: Record<string, string> = {}) =>
@@ -350,5 +355,57 @@ describe('v2 phase 2: subagents routed by type and job (section 4.6)', () => {
     const [row] = w.store.get('log:session-1') as Record<string, unknown>[]
     expect(row).toMatchObject({ kind: 'route', agent: 'Explore', job: 'search', model: 'haiku', effort: 'medium', session: 'session-1' })
     expect(await picks($, 'log')).toContain('1 subagents routed by type: 1 search, 0 review, 0 work, 0 kept on the parent')
+  })
+})
+
+describe('v2 phase 4: two runs before a move down (4.5) and what the judge sees (4.2)', () => {
+  const lookup = facts({ work: 'what HTTP 429 means', action: 'lookup', scope: 'one' })
+  const opusSession = (w: World) => ((w.model = 'claude-opus-5-5'), w)
+
+  test('a move down runs the judge a second time, and is offered when both runs agree', async ($, on) => {
+    const w = opusSession(session(on, labels => labels.at(-1)!, () => reply(lookup)))
+    await $.prompt.submit({ text: 'what does HTTP 429 mean', ...composer })
+    expect(w.judged).toBe(2)
+    expect(w.asked).toEqual([['Best: Sonnet 5.5 · low', 'Balanced: same as Best', 'Keep: Opus 5.5 · medium']])
+    const [entry] = w.store.get('log:session-1') as Record<string, unknown>[]
+    expect(entry).toMatchObject({ agreed: true, chosen: 'keep' })
+  })
+
+  test('when the second run disagrees the setup stays, with no question', async ($, on) => {
+    const w = opusSession(session(on, labels => labels[0]!, n => reply(n === 1 ? lookup : facts({ scope: 'many' }))))
+    await $.prompt.submit({ text: 'what does HTTP 429 mean', ...composer })
+    expect(w.judged).toBe(2)
+    expect(w.asked).toEqual([])
+    const [entry] = w.store.get('log:session-1') as Record<string, unknown>[]
+    expect(entry).toMatchObject({ agreed: false, held: 'the two runs disagree', chosen: 'silent' })
+  })
+
+  test('a failed second run holds the setup too', async ($, on) => {
+    const w = opusSession(session(on, labels => labels[0]!, n => (n === 1 ? reply(lookup) : { isAnswered: false, reason: 'aborted', usage })))
+    await $.prompt.submit({ text: 'what does HTTP 429 mean', ...composer })
+    expect(w.asked).toEqual([])
+  })
+
+  test('a move up is asked about after one run', async ($, on) => {
+    const w = session(on, labels => labels.at(-1)!)
+    await $.prompt.submit({ text: NOTICE, ...composer })
+    expect(w.judged).toBe(1)
+  })
+
+  test('the judge sees what the last turns did: tools, files edited and errors', async ($, on) => {
+    const w = session(on, labels => labels.at(-1)!)
+    w.rows = [
+      { role: 'user', text: 'Add retries to the sync engine.' },
+      {
+        role: 'assistant', text: '', toolUses: [
+          { tool_use_id: 'u1', tool: 'Edit', input: { file_path: '/repo/sync.ts' } },
+          { tool_use_id: 'u2', tool: 'Bash', input: {}, isError: true },
+        ],
+      },
+      { role: 'assistant', text: 'The CI test still fails. Want me to dig in?' },
+    ]
+    await $.prompt.submit({ text: NOTICE, ...composer })
+    expect(w.prompts[0]).toContain('assistant did: tools Edit 1, Bash 1; edited sync.ts; errors: Bash 1')
+    expect(w.prompts[0]).toContain("assistant's last message: The CI test still fails. Want me to dig in?")
   })
 })

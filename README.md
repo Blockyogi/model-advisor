@@ -46,14 +46,16 @@ Leave it empty and the judge assumes a general mix of work. You can change it la
 
 ## How it decides
 
-1. Claude Haiku 5.5, at low effort, reads your prompt and the last few turns and describes the work: light, standard, deep or frontier, plus flags such as "changes production", "a fix already failed" or "an outside audience reads it". It never sees model names.
-2. Fixed rules in code turn that into Best and Balanced. Some of them:
-   - Legal letters, tender submissions, production changes and debugging after a failed fix are never routed to a cheaper setup.
-   - Mechanical work (installing a build, pushing, scheduling approved posts) is never upgraded.
-   - Fable is offered only after an earlier attempt failed.
+1. Claude Haiku 5.5, at low effort, reads your prompt and the last few turns (what you typed, which tools ran, which files changed, what errored, and the assistant's last message) and reports facts about the work: what it does (look something up, ship something already decided, edit, build, debug, research, draft, plan), how much it touches, whether it is new ground, whether you can check it at a glance, and flags such as "changes production", "a fix already failed" or "an outside audience reads it". It never rates how hard the work is and never sees model names.
+2. Fixed rules in code turn those facts into a tier (light, standard, deep or frontier), then into Best and Balanced. Some of them:
+   - Legal letters, tender submissions, production changes, public copy and debugging after a failed fix are never routed to a cheaper setup.
+   - Mechanical work (installing a build, pushing, scheduling approved posts) is never upgraded. A go-ahead or a status reply ("done, I've signed in") carries the work it resumes.
+   - Haiku is never offered for your main session; light work gets Sonnet 5.5 at low.
+   - Fable is offered only after Opus at xhigh has also fallen short, and never for research.
+   - A move to a cheaper setup needs two judge runs that agree; otherwise your setup stays.
    - In a long conversation, a cheaper model has to pay back its one-time re-read within two prompts, so the advisor prefers an effort change.
    - Balanced gets cheaper as your weekly or 5-hour limit fills up.
-3. It asks only when a change would really help. Small nudges, like Opus medium to Opus high, stay silent, except for work that is never routed down (legal letters, tenders, production changes, a failed fix).
+3. It asks only when a change would really help. Small nudges, like Opus medium to Opus high, stay silent, except for work that is never routed down (legal letters, tenders, production changes, public copy, a failed fix).
 
 If your prompt names its own setup in a line or sentence that starts with "Recommended" or "Model" (for example `Recommended: Opus 5.5 at high effort.` or `Model: Opus 5.5, high effort.`), that becomes Best, and the advisor's own lighter pick is offered as Balanced. A model named anywhere else is read as part of the request.
 
@@ -72,7 +74,7 @@ A call that names its own model or effort keeps it. Other agent types (design-cr
 - **Your prompts stay with you.** The judge runs through your own Claude Code sign-in; nothing is sent anywhere else. It costs about $1 a month of plan usage at heavy use.
 - **It fails open.** If the judge is slow or errors, your prompt runs unchanged.
 - **Headless runs are skipped.** Prompts in a `claude -p` run are not judged, since no one is there to answer.
-- **The log holds no prompt text.** `/picks log` keeps the category, the picks and your choice, with the session id and prompt number, so you can see where the advisor over-asks.
+- **The log holds no prompt text.** `/picks log` keeps the judge's facts, the tier, the picks and your choice, with the session id and prompt number, so you can see where the advisor over-asks.
 
 ## Remove it
 

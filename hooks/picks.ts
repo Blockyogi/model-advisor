@@ -1,8 +1,9 @@
-// Turns the judge's verdict into Best and Balanced. All safety rules live here,
-// in code: never-route-down, continuations, the lopsided rule, Haiku over 100K,
-// plan limits, and the two-prompt rule for mid-session model switches.
+// Turns the judge's facts into a tier, and the tier into Best and Balanced. All
+// rules live here, in code: the tier table, never-route-down, continuations,
+// the lopsided rule, two runs before a move down, plan limits, and the
+// two-prompt rule for mid-session model switches.
 
-import type { Domain, Tier, Verdict } from './judge'
+import type { Domain, Flag, Tier, Verdict } from './judge'
 
 export const MODELS = {
   haiku: 'claude-haiku-5-5',
@@ -64,16 +65,44 @@ const TIER_RANK: Record<Tier, number> = { light: 0, standard: 1, deep: 2, fronti
 const same = (a: Setup, b: Setup) => a.model === b.model && a.effort === b.effort
 const s = (model: ModelKey, effort: Effort): Setup => ({ model, effort })
 
-// Section 4 and the section 3 task map of the research document.
-function table(tier: Tier, domain: Domain, v: Verdict, isFirstPrompt: boolean): { best: Setup; balanced: Setup } {
-  const leansSonnet = domain === 'website' || domain === 'spreadsheet'
+// The tier the facts call for (v2 plan 4.1), from the definitions the phase 3
+// labels used: light is looking something up or one act already decided;
+// standard is a few steps along a known pattern, edits as specified, or a draft
+// for review; deep is many files or sources, new ground, a result not checkable
+// at a glance, an unknown cause, a failed attempt, numbers that must tie out,
+// or a legal or tender text for an outside party. Frontier is a failed attempt
+// at work already rated deep: the judge cannot count attempts reliably (it saw
+// "failed twice" in 3 dev prompts, wrongly each time), so the session's own
+// tier is the evidence. Stakes (production, money, irreversible) never raise
+// the tier: never-route-down keeps such work from moving down instead.
+// outside_audience and relied_on alone did not track the labels well enough
+// to raise it (section 11 of the v2 plan).
+const HARDER: readonly Flag[] = ['unknown_cause', 'failed_before', 'must_reconcile']
+
+export function tierOf(v: Verdict, previousTier?: Tier): Tier {
+  const has = (f: Flag) => v.flags.includes(f)
+  const many = v.scope === 'many'
+  // Looking something up, or one known act, is light; many separate acts are a job.
+  if (v.action === 'ship' || v.action === 'lookup') return many || has('unknown_cause') || has('must_reconcile') ? 'standard' : 'light'
+  const legalText = (v.domain === 'legal' || v.domain === 'tender') && has('outside_audience') &&
+    (v.action === 'draft' || v.action === 'edit' || v.action === 'answer' || v.action === 'plan')
+  // Many edits made as specified (sorting folders, an inbox clean-up) stay a known job.
+  const harder = (many && v.action !== 'edit') || !v.checkable || v.novelty === 'new' || HARDER.some(has) || legalText
+  if (!harder) return 'standard'
+  const deepBefore = previousTier === 'deep' || previousTier === 'frontier'
+  return has('failed_before') && deepBefore ? 'frontier' : 'deep'
+}
+
+// Section 4 of the v1 research and section 4.7 of the v2 plan.
+function table(tier: Tier, domain: Domain, v: Verdict, current: Setup): { best: Setup; balanced: Setup } {
   switch (tier) {
     case 'light':
-      return isFirstPrompt
-        ? { best: s('haiku', 'medium'), balanced: s('haiku', 'low') }
-        : { best: s('sonnet', 'low'), balanced: s('haiku', 'low') }
+      // Haiku was offered 34 times as a main-session Best and never taken; it stays for subagents.
+      return { best: s('sonnet', 'low'), balanced: s('sonnet', 'low') }
     case 'standard':
-      if (leansSonnet) return { best: s('sonnet', 'high'), balanced: s('sonnet', 'medium') }
+      // Opus leads WebDev Arena and the big website benchmarks sit within 2 points; Sonnet codes at high, not medium.
+      if (domain === 'website') return { best: s('opus', 'medium'), balanced: s('sonnet', 'high') }
+      if (domain === 'spreadsheet') return { best: s('sonnet', 'high'), balanced: s('sonnet', 'medium') }
       if (domain === 'copy') return { best: s('opus', 'medium'), balanced: s('opus', 'medium') }
       return { best: s('opus', 'medium'), balanced: domain === 'ios' || domain === 'code' ? s('opus', 'low') : s('sonnet', 'medium') }
     case 'deep':
@@ -81,28 +110,30 @@ function table(tier: Tier, domain: Domain, v: Verdict, isFirstPrompt: boolean): 
       if (v.flags.includes('unknown_cause') && (domain === 'code' || domain === 'ios' || domain === 'website'))
         return { best: s('opus', 'xhigh'), balanced: s('opus', 'high') }
       return { best: s('opus', 'high'), balanced: s('opus', 'medium') }
-    case 'frontier':
-      // Fable only once Opus has fallen short (Anthropic's guidance); never for research.
-      if (domain === 'research' || !v.flags.includes('failed_before')) return { best: s('opus', 'xhigh'), balanced: s('opus', 'high') }
-      return { best: s('fable', 'high'), balanced: s('opus', 'xhigh') }
+    case 'frontier': {
+      // Fable only once Opus at xhigh has also fallen short (Opus 5.5 medium
+      // matched Fable 5.1 high on SWE-bench Pro), and never for research.
+      const onTopSetup = current.model === 'fable' || (current.model === 'opus' && (current.effort === 'xhigh' || current.effort === 'max'))
+      if (domain !== 'research' && v.flags.includes('failed_before') && onTopSetup) return { best: s('fable', 'high'), balanced: s('opus', 'xhigh') }
+      return { best: s('opus', 'xhigh'), balanced: s('opus', 'high') }
+    }
   }
 }
 
-// Mechanical work (install, push, rename, a known command) needs care, not a
-// stronger model. A verdict counts as mechanical only when the work is at most
-// standard (a continuation carries the tier of the work it continues) and
-// nothing in it needs reasoning: no unknown cause, failed attempt or many sources.
+// Mechanical work (install, push, rename, a known command, sending approved
+// text) needs care, not a stronger model. A go-ahead or status reply is
+// mechanical only when the step it resumes is: its action is that step's.
 export function isMechanical(v: Verdict): boolean {
-  if (!v.mechanical) return false
-  if (v.flags.some(f => f === 'unknown_cause' || f === 'failed_before' || f === 'many_sources')) return false
-  return v.continuation || TIER_RANK[v.tier] <= TIER_RANK.standard
+  return v.action === 'ship' && v.scope !== 'many' && !v.flags.some(f => f === 'unknown_cause' || f === 'failed_before')
 }
 
 export function isNeverDown(v: Verdict, tier: Tier): boolean {
   if (v.risky) return true
   if (v.domain === 'legal' || v.domain === 'tender') return true
   if (v.flags.some(f => f === 'production' || f === 'money' || f === 'irreversible' || f === 'failed_before')) return true
-  if (v.domain === 'copy' && v.flags.includes('outside_audience')) return true
+  // Public text: copy is public by its definition, and a website change is when the public reads what it changes.
+  if (v.domain === 'copy' && v.action !== 'lookup') return true
+  if (v.domain === 'website' && v.flags.includes('outside_audience')) return true
   if ((v.domain === 'ledger' || v.domain === 'finance') && tier !== 'light' && v.flags.some(f => f === 'must_reconcile' || f === 'relied_on')) return true
   return false
 }
@@ -205,19 +236,19 @@ export function decide(verdict: Verdict, ctx: PickContext): Decision {
   // A first prompt continues nothing in this session.
   const v = ctx.isFirstPrompt ? { ...verdict, continuation: false } : verdict
   const mechanical = isMechanical(v)
-  let tier = v.tier
-  // Frontier needs evidence: an earlier attempt failed, or many sources.
-  if (tier === 'frontier' && !v.flags.some(f => f === 'failed_before' || f === 'many_sources')) tier = 'deep'
-  // Mechanical work is light, and never-route-down below keeps a risky act where it is.
-  if (mechanical) tier = 'light'
-  // Continuations inherit the tier of the work and are never routed down.
-  if (v.continuation && !mechanical && ctx.previousTier && TIER_RANK[ctx.previousTier] > TIER_RANK[tier]) tier = ctx.previousTier
-  // Any up-flag lifts a light verdict.
-  if (tier === 'light' && v.flags.length > 0 && !mechanical) tier = 'standard'
+  let tier = tierOf(v, ctx.previousTier)
+  // A go-ahead or status reply resumes real work unless its step is mechanical
+  // (push it, send it): at least standard, and the tier of the work it resumes.
+  if (v.continuation && !mechanical) {
+    if (tier === 'light') tier = 'standard'
+    if (ctx.previousTier && TIER_RANK[ctx.previousTier] > TIER_RANK[tier]) tier = ctx.previousTier
+  }
   const neverDown = isNeverDown(v, tier) || (v.continuation && (tier === 'deep' || tier === 'frontier'))
-  if (neverDown && tier === 'light' && !mechanical) tier = 'standard'
 
-  let { best, balanced } = table(tier, v.domain, v, ctx.isFirstPrompt)
+  let { best, balanced } = table(tier, v.domain, v, ctx.current)
+  // Never-route-down work that needs thought runs on Opus 5.5 at medium or above,
+  // whatever its tier: the stakes set a floor, they do not make the work harder.
+  if (neverDown && !mechanical) best = atLeast(best, s('opus', 'medium'))
 
   // Risky acts run on Opus 5.5 at high or above.
   if (v.risky && !mechanical) {
@@ -230,13 +261,6 @@ export function decide(verdict: Verdict, ctx: PickContext): Decision {
   const tight = (ctx.limits.weekly ?? 0) >= 80 || (ctx.limits.fiveHour ?? 0) >= 85
   if (tight && !neverDown) balanced = cheaper(balanced)
 
-  // Haiku never takes a conversation over 100K tokens.
-  const big = ctx.contextTokens > 100_000
-  if (big) {
-    if (best.model === 'haiku') best = s('sonnet', 'low')
-    if (balanced.model === 'haiku') balanced = s('sonnet', 'low')
-  }
-
   // Two-prompt rule for mid-session switches to a cheaper model.
   best = keepModelIfSwitchDoesNotPay(best, ctx, v, tier)
   balanced = keepModelIfSwitchDoesNotPay(balanced, ctx, v, tier)
@@ -246,18 +270,17 @@ export function decide(verdict: Verdict, ctx: PickContext): Decision {
   if (!ctx.isFirstPrompt && ctx.contextTokens >= 100_000 && ctx.current.model === 'opus' && balanced.model === 'sonnet')
     balanced = s('opus', 'low')
 
-  // Lopsided rule: neither pick drops below the current setup unless the judge
-  // is sure, and never for never-route-down work.
+  // Lopsided rule: neither pick drops below the current setup for
+  // never-route-down work or a continuation; elsewhere a move down needs a
+  // second judge run that agrees (agree() below).
   // Mid-session, a one-off aside never moves the session down: the choice
   // sticks, so the work after it would inherit the cheaper setup.
   let held: string | undefined
-  const hold = (why: string, balancedFloor = ctx.current) => {
+  const hold = (why: string) => {
     if (below(best, ctx.current)) (best = ctx.current), (held = why)
-    if (below(balanced, balancedFloor)) (balanced = balancedFloor), (held = why)
+    if (below(balanced, ctx.current)) (balanced = ctx.current), (held = why)
   }
-  if (neverDown || v.continuation) hold('not sure enough to go lower')
-  // With plan limits tight, an unsure Balanced may still go one effort notch lower.
-  else if (v.confidence !== 'high') hold('not sure enough to go lower', tight ? effortNotchDown(ctx.current) : ctx.current)
+  if (neverDown || v.continuation) hold(neverDown ? 'never routed down' : 'it continues the work in progress')
   if (!ctx.isFirstPrompt && !v.ongoing) hold('one-off aside')
   // A light request inside heavier work is an aside, whatever the judge says of it.
   if (!ctx.isFirstPrompt && tier === 'light' && ctx.previousTier !== 'light') hold('light aside in heavier work')
@@ -266,19 +289,23 @@ export function decide(verdict: Verdict, ctx: PickContext): Decision {
   // The prompt's own model and effort win: it was decided when it was written.
   // A setup the prompt names becomes Best; the advisor's own pick stays as
   // Balanced when it is lighter, so a heavy plan choice can still be declined.
-  const why = v.why
+  const why = v.work
   if (ctx.stated) {
     const own = best
     best = ctx.stated
     balanced = weight(own) < weight(ctx.stated) ? own : ctx.stated
   }
 
-  // Speak only when a change would help: any move up, a model change, or an
-  // effort-only move down that saves at least 40%. Smaller savings are not worth a question.
-  // A same-model effort step up under 1.5x (Opus medium to high) is not worth a
-  // question, except for never-route-down or risky work, and on Sonnet, which
-  // gains far more from medium to high.
-  // A continuation of plain deep work is not on that list: it stays as quiet as the work it continues.
+  return { tier, neverDown, best, balanced, speak: speaks(best, balanced, v, tier, ctx), why, held }
+}
+
+// Speak only when a change would help: any move up, a model change, or an
+// effort-only move down that saves at least 40%. Smaller savings are not worth a question.
+// A same-model effort step up under 1.5x (Opus medium to high) is not worth a
+// question, except for never-route-down or risky work, and on Sonnet, which
+// gains far more from medium to high.
+// A continuation of plain deep work is not on that list: it stays as quiet as the work it continues.
+function speaks(best: Setup, balanced: Setup, v: Verdict, tier: Tier, ctx: PickContext): boolean {
   const smallStepUp = (pick: Setup) =>
     !isNeverDown(v, tier) && pick.model === 'opus' &&
     pick.model === ctx.current.model && weight(pick) > weight(ctx.current) && weight(pick) / weight(ctx.current) < 1.5
@@ -289,5 +316,32 @@ export function decide(verdict: Verdict, ctx: PickContext): Decision {
       pick.model !== ctx.current.model ||
       ctx.currentIsLatest === false ||
       1 - weight(pick) / weight(ctx.current) >= 0.4)
-  return { tier, neverDown, best, balanced, speak: helps(best) || helps(balanced), why, held }
+  return helps(best) || helps(balanced)
+}
+
+// Haiku's stated confidence carries no information (it said "low" once in 393
+// verdicts), so a move down needs a second judge run instead (v2 plan 4.5).
+// Only a prompt with no setup of its own is checked: a named setup is the person's call.
+export const movesDown = (d: Decision, ctx: PickContext) => !ctx.stated && (below(d.best, ctx.current) || below(d.balanced, ctx.current))
+
+export const DISAGREE = 'the two runs disagree'
+
+// A pick below the current setup stands only when the second run also goes
+// below it; where both do, the higher of the two stands. With plan limits
+// tight, Balanced may still go one effort notch lower when the runs disagree,
+// unless either run calls the work never-route-down.
+export function agree(first: Decision, second: Decision | undefined, v: Verdict, ctx: PickContext): Decision {
+  const tight = (ctx.limits.weekly ?? 0) >= 80 || (ctx.limits.fiveHour ?? 0) >= 85
+  const neverDown = first.neverDown || second?.neverDown === true
+  let held = first.held
+  const settle = (pick: Setup, other: Setup | undefined, floor: Setup): Setup => {
+    if (!below(pick, ctx.current)) return pick
+    if (other && below(other, ctx.current)) return below(pick, other) ? other : pick
+    held = DISAGREE
+    return below(pick, floor) ? floor : pick
+  }
+  const best = settle(first.best, second?.best, ctx.current)
+  let balanced = settle(first.balanced, second?.balanced, tight && !neverDown ? effortNotchDown(ctx.current) : ctx.current)
+  if (weight(balanced) > weight(best)) balanced = best
+  return { ...first, neverDown, best, balanced, held, speak: speaks(best, balanced, v, first.tier, ctx) }
 }

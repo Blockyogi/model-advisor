@@ -4,8 +4,11 @@
 
 import type { EngineInterface, Register, SessionMessage } from 'claude-code'
 import type { AdvisorActive } from '../types'
-import { isSkippable, judgeRequest, parseVerdict, statedSetup, type JudgeFacts, type Turn, type Verdict } from './judge'
-import { decide, isMechanical, label, MODELS, modelKey, subagentJob, subagentRoute, type Decision, type Effort, type Limits, type Setup, type SubagentJob } from './picks'
+import { isSkippable, judgeRequest, ownWords, parseVerdict, statedSetup, summarizeTurns, type JudgeFacts, type TurnSummary, type Verdict } from './judge'
+import {
+  agree, decide, DISAGREE, isMechanical, label, MODELS, modelKey, movesDown, subagentJob, subagentRoute,
+  type Decision, type Effort, type Limits, type Setup, type SubagentJob,
+} from './picks'
 import { questionText, rows } from './reasons'
 
 const ACTIVE = { plugin: 'model-advisor', key: 'active' } as const
@@ -38,14 +41,21 @@ export type LogEntry = {
   // the prompt's number in the session (for a subagent, the prompt it serves)
   turn?: number
   origin?: string
-  // the judge's own tier; finalTier is the tier after the rules
-  tier: string
+  // until phase 4 (18 Oct 2026) the judge rated the tier itself (`tier`, `confidence`);
+  // from then it reports facts (action, scope, novelty, checkable) and finalTier is computed
+  tier?: string
   finalTier?: string
+  action?: string
+  scope?: string
+  novelty?: string
+  checkable?: boolean
   domain: string
   flags: string[]
   risky?: boolean
   mechanical?: boolean
-  confidence: string
+  confidence?: string
+  // a move down ran the judge twice: whether the runs agreed
+  agreed?: boolean
   continuation: boolean
   ongoing: boolean
   previousTier?: string
@@ -189,10 +199,6 @@ async function ask($: $, d: Decision, v: Verdict, current: Setup, ctx: Parameter
   }
 }
 
-function recentTurns(rows: readonly SessionMessage[]): Turn[] {
-  return rows.filter(m => m.text.trim()).slice(-6).map(m => ({ role: m.role, text: m.text }))
-}
-
 function limitsOf(rateLimits: readonly { kind: string; percentUsed: number }[]) {
   return {
     fiveHour: rateLimits.find(r => r.kind === 'five_hour')?.percentUsed,
@@ -209,16 +215,10 @@ const MACHINE_ORIGINS = new Set<string>([
   'observer', 'observer-activity', 'auto-continuation', 'slack-ping', 'plugin',
 ])
 
-// The app prefixes some prompts with <system-reminder> blocks (worktree path,
-// linked sessions); the judge reads only the person's own words.
-function ownWords(text: string): string {
-  return text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
-}
-
 // The plugin's `about` setting, read when the module loads.
 let about = ''
 
-async function judge($: $, text: string, recent: Turn[], facts: Omit<JudgeFacts, 'previousTier'>, timeoutMs: number) {
+async function judge($: $, text: string, recent: TurnSummary[], facts: Omit<JudgeFacts, 'previousTier'>, timeoutMs: number) {
   const previousTier = (await $.state.get(PREVIOUS_TIER)).value ?? undefined
   const started = Date.now()
   const r = await $.model.complete(judgeRequest(text, recent, { ...facts, previousTier }, timeoutMs, about))
@@ -227,12 +227,12 @@ async function judge($: $, text: string, recent: Turn[], facts: Omit<JudgeFacts,
   return { verdict, ms: Date.now() - started, previousTier }
 }
 
-type JudgeFields = 'at' | 'tier' | 'domain' | 'flags' | 'risky' | 'mechanical' | 'confidence' | 'continuation' | 'ongoing'
+type JudgeFields = 'at' | 'action' | 'scope' | 'novelty' | 'checkable' | 'domain' | 'flags' | 'risky' | 'mechanical' | 'continuation' | 'ongoing'
 function entry(v: Verdict, rest: Omit<LogEntry, JudgeFields>): LogEntry {
   return {
     at: new Date().toISOString(),
-    tier: v.tier, domain: v.domain, flags: v.flags, risky: v.risky, mechanical: v.mechanical, confidence: v.confidence,
-    continuation: v.continuation, ongoing: v.ongoing, ...rest,
+    action: v.action, scope: v.scope, novelty: v.novelty, checkable: v.checkable, domain: v.domain, flags: v.flags,
+    risky: v.risky, mechanical: isMechanical(v), continuation: v.continuation, ongoing: v.ongoing, ...rest,
   }
 }
 
@@ -263,7 +263,9 @@ export const register: Register = (on, options) => {
     ])
     const isFirstPrompt = !rows.some(m => m.role === 'user' && m.text.trim())
     const contextTokens = isFirstPrompt ? 0 : usage.context.tokens ?? 0
-    const { verdict, ms, previousTier } = await judge($, text, recentTurns(rows), { isFirstPrompt, contextTokens }, JUDGE_TIMEOUT_MS)
+    const recent = summarizeTurns(rows)
+    const facts = { isFirstPrompt, contextTokens }
+    const { verdict, ms, previousTier } = await judge($, text, recent, facts, JUDGE_TIMEOUT_MS)
     if (!verdict) {
       if (isFirstPrompt) $.ui.toast('Model advisor: could not check this prompt, so it runs as set')
       return next(e)
@@ -271,9 +273,18 @@ export const register: Register = (on, options) => {
 
     const statedPick = stated(text)
     const limits = limitsOf(usage.rateLimits)
-    const d = decide(verdict, {
-      current, currentIsLatest: isLatest, stated: statedPick, isFirstPrompt, contextTokens, previousTier, limits,
-    })
+    const ctx = { current, currentIsLatest: isLatest, stated: statedPick, isFirstPrompt, contextTokens, previousTier, limits }
+    let d = decide(verdict, ctx)
+    // A move down stands only if a second run agrees; a failed second run holds it.
+    let agreed: boolean | undefined
+    let judgeMs = ms
+    if (movesDown(d, ctx)) {
+      const second = await judge($, text, recent, facts, JUDGE_TIMEOUT_MS)
+      judgeMs += second.ms
+      const checked = agree(d, second.verdict && decide(second.verdict, ctx), verdict, ctx)
+      agreed = checked.held !== DISAGREE
+      d = second.verdict ? checked : { ...checked, held: 'the second run failed' }
+    }
     const chosen: Choice = d.speak
       ? await ask($, d, verdict, current, { contextTokens, isFirstPrompt, limits, isStated: !!statedPick })
       : 'silent'
@@ -287,7 +298,7 @@ export const register: Register = (on, options) => {
     await appendLog($, entry(verdict, {
       kind: 'main', turn: turns + 1, origin: e.origin.kind, finalTier: d.tier, previousTier, neverDown: d.neverDown, limits,
       first: isFirstPrompt, contextK: Math.round(contextTokens / 1000), current: label(current),
-      best: label(d.best), balanced: label(d.balanced), chosen, stated: !!statedPick, held: d.held, judgeMs: ms,
+      best: label(d.best), balanced: label(d.balanced), chosen, stated: !!statedPick, held: d.held, agreed, judgeMs,
     }))
     // One brief sign on the first prompt that the advisor checked and found nothing to change.
     if (!pick && isFirstPrompt && chosen === 'silent')
