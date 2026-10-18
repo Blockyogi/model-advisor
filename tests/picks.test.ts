@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'claude-code/testing'
-import { isSkippable, judgeUserMessage, parseVerdict, recentBlock, statedSetup, summarizeTurns, type MessageRow, type Verdict } from '../hooks/judge'
-import { agree, decide, DISAGREE, isMechanical, label, movesDown, subagentJob, subagentRoute, tierOf, weight, type PickContext } from '../hooks/picks'
+import {
+  isSkippable, judgeUserMessage, nearestCases, parseVerdict, recentBlock, reportsFailure, statedSetup, summarizeTurns, turnFailure,
+  type MessageRow, type Verdict,
+} from '../hooks/judge'
+import { agree, decide, DISAGREE, isMechanical, label, movesDown, stepUp, subagentJob, subagentRoute, tierOf, weight, type PickContext } from '../hooks/picks'
 import { questionText, rows } from '../hooks/reasons'
 
 // The judge reports facts; by default a build of a few files along a known pattern (standard).
@@ -451,8 +454,9 @@ describe('phase 4: the judge sees what was done (4.2)', () => {
         typed: 'Add retries to the sync engine.',
         work: 'tools Read 1, Edit 1, Bash 1, claude-in-chrome:navigate 1; edited sync.ts; errors: Bash 1',
         reply: 'Retries are in, but the CI test still fails. Should I look at the CI config?',
+        signals: { testFails: 0, testsRed: false, sameFileEdits: 1, endedOnError: false },
       },
-      { typed: 'yes', work: 'no tools', reply: 'The CI image pins an old Node.' },
+      { typed: 'yes', work: 'no tools', reply: 'The CI image pins an old Node.', signals: { testFails: 0, testsRed: false, sameFileEdits: 0, endedOnError: false } },
     ])
   })
 
@@ -471,5 +475,114 @@ describe('phase 4: the judge sees what was done (4.2)', () => {
     expect(text).toContain('The work so far was rated deep.')
     expect(text).toContain('assistant did: tools Read 1')
     expect(text).toMatch(/<request>\ncarry on\n<\/request>$/)
+  })
+})
+
+describe('phase 5: a step up when an attempt fails (4.3)', () => {
+  const opus = (effort: 'low' | 'medium' | 'high' | 'xhigh') => ({ model: 'opus' as const, effort })
+  const sonnet = (effort: 'low' | 'medium' | 'high') => ({ model: 'sonnet' as const, effort })
+
+  test('the ladder: one effort step first, then a model step; Fable only after Opus xhigh, never for research', () => {
+    expect(label(stepUp(opus('medium'), 1, 'code'))).toBe('Opus 5.5 · high')
+    expect(label(stepUp(opus('medium'), 2, 'code'))).toBe('Opus 5.5 · xhigh')
+    expect(label(stepUp(opus('xhigh'), 1, 'code'))).toBe('Fable 5.1 · high')
+    expect(label(stepUp(opus('xhigh'), 2, 'research'))).toBe('Opus 5.5 · xhigh')
+    expect(label(stepUp(sonnet('medium'), 1, 'code'))).toBe('Sonnet 5.5 · high')
+    expect(label(stepUp(sonnet('medium'), 2, 'code'))).toBe('Opus 5.5 · high')
+    expect(label(stepUp(sonnet('high'), 1, 'code'))).toBe('Opus 5.5 · high')
+  })
+
+  test('a first failure mid-session on Opus medium asks about Opus high, never routed down', () => {
+    const d = decide(verdict({ action: 'debug', scope: 'one' }), mid({ failures: 1 }))
+    expect([label(d.best), label(d.balanced)]).toEqual(['Opus 5.5 · high', 'Opus 5.5 · high'])
+    expect(d.tier).toBe('deep')
+    expect(d.neverDown).toBe(true)
+    expect(d.steppedUp).toBe(true)
+    expect(d.speak).toBe(true)
+  })
+
+  test('a second failure in a row is frontier: Best the model step, Balanced the effort step', () => {
+    const d = decide(verdict({ action: 'debug', scope: 'one' }), mid({ failures: 2 }))
+    expect(d.tier).toBe('frontier')
+    expect([label(d.best), label(d.balanced)]).toEqual(['Opus 5.5 · xhigh', 'Opus 5.5 · high'])
+  })
+
+  test('mid-session the step stays on the session model, which keeps the cache', () => {
+    const d = decide(deep({ action: 'debug', flags: ['unknown_cause'] }), mid({ current: sonnet('medium'), failures: 1 }))
+    expect([label(d.best), label(d.balanced)]).toEqual(['Sonnet 5.5 · high', 'Sonnet 5.5 · high'])
+  })
+
+  test('the table wins when it asks for more on the same model', () => {
+    const d = decide(deep({ action: 'debug', flags: ['unknown_cause'] }), mid({ failures: 1 }))
+    expect(label(d.best)).toBe('Opus 5.5 · xhigh')
+    expect(label(d.balanced)).toBe('Opus 5.5 · high')
+  })
+
+  test('at the top for research there is nothing to step up to, so it stays quiet', () => {
+    const d = decide(verdict({ action: 'research', domain: 'research' }), mid({ current: opus('xhigh'), failures: 2 }))
+    expect(d.speak).toBe(false)
+  })
+
+  test('the question says the last attempt fell short', () => {
+    const v = verdict({ action: 'debug', scope: 'one', work: 'fix the sign-up crash' })
+    expect(questionText(decide(v, mid({ failures: 1 })), v, {})).toBe('Deep code work: fix the sign-up crash. The last attempt fell short. Which setup should run it?')
+  })
+
+  test('with no failure nothing changes', () => {
+    const d = decide(verdict(), mid({ failures: 0 }))
+    expect(d.steppedUp).toBe(false)
+    expect(d.tier).toBe('standard')
+  })
+
+  test('the person\'s words: real failure reports count; "still" alone, doubt, quotes and plans that did not work out do not', () => {
+    for (const t of ['Still broken.', "That didn't work.", 'Same error as before', 'try again', 'The hero is still blank on mobile', 'Dev server link is not working.', 'This looks like it hasn\'t changed.'])
+      expect([t, reportsFailure(t)]).toEqual([t, true])
+    for (const t of ['What is still open?', "I'm still not sure about the hook.", "Yesterday's post didn't work out well.", 'corrections ("still", "didn\'t work")', 'It is still missing a few foods.', 'Is it still running?'])
+      expect([t, reportsFailure(t)]).toEqual([t, false])
+  })
+
+  test('the turn before fell short: tests failing twice and still red, or an error after an edit; edits alone are no sign', () => {
+    const turn = (uses: { tool: string; input: Record<string, unknown>; isError?: boolean }[]) =>
+      summarizeTurns([{ role: 'user', text: 'fix it' }, { role: 'assistant', text: 'done', toolUses: uses }]).at(-1)?.signals
+    const npm = (isError: boolean) => ({ tool: 'Bash', input: { command: 'cd app && npm test' }, isError })
+    const edit = { tool: 'Edit', input: { file_path: '/app/a.ts' } }
+    expect(turnFailure(turn([npm(true), npm(true)]))).toBe('tests still failing')
+    expect(turnFailure(turn([npm(true), npm(true), npm(false)]))).toBe(undefined)
+    expect(turnFailure(turn([edit, { tool: 'Bash', input: { command: 'swift build' }, isError: true }]))).toBe('ended on an error')
+    expect(turnFailure(turn([{ tool: 'Bash', input: { command: 'grep x' }, isError: true }]))).toBe(undefined)
+    const edits = turn([edit, edit, edit])
+    expect(edits?.sameFileEdits).toBe(3)
+    expect(turnFailure(edits)).toBe(undefined)
+  })
+})
+
+describe('phase 5: the light-call gap (section 11)', () => {
+  test('one lookup that continues the work stays light; a lookup of several things is lifted to standard', () => {
+    expect(decide(light({ continuation: true }), mid({ previousTier: 'deep' })).tier).toBe('light')
+    expect(decide(light({ continuation: true, scope: 'few' }), mid({ previousTier: 'standard' })).tier).toBe('standard')
+  })
+})
+
+describe('phase 5: past cases (4.4 step 2)', () => {
+  const cases = [
+    { text: 'Draft the RERA legal notice to the builder for the refund.', tier: 'deep' as const },
+    { text: 'Push the passes to origin main.', tier: 'light' as const },
+    { text: 'Please tell me now, okay, what you think.', tier: 'standard' as const },
+  ]
+  test('word overlap finds similar requests; shared filler words alone do not count', () => {
+    expect(nearestCases('Draft a legal notice to the builder about delayed possession.', cases).map(c => c.tier)).toEqual(['deep'])
+    expect(nearestCases('Okay, please tell me what you think now.', cases)).toEqual([])
+    expect(nearestCases('x', cases)).toEqual([])
+  })
+  test('at most five, nearest first', () => {
+    const many = Array.from({ length: 8 }, (_, i) => ({ text: `rerun the sign-up tests ${'extra '.repeat(i)}`, tier: 'standard' as const }))
+    const near = nearestCases('rerun the sign-up tests', many)
+    expect(near.length).toBe(5)
+    expect(near[0]).toBe(many[0])
+  })
+  test('the past block comes before the recent turns and the request', () => {
+    const text = judgeUserMessage('Draft a legal notice to the builder.', [], { isFirstPrompt: true, contextTokens: 0 }, [cases[0]!])
+    expect(text).toContain('<past>\n- needed deep work: Draft the RERA legal notice to the builder for the refund.\n</past>')
+    expect(text.indexOf('<past>')).toBeLessThan(text.indexOf('<request>'))
   })
 })

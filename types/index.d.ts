@@ -18,6 +18,7 @@ declare module 'claude-code' {
       isOff: boolean
       seenEffort: string | null
       taskNeverDown: boolean | null
+      failures: number | null
     }
   }
 }

@@ -31,6 +31,8 @@ export type PickContext = {
   contextTokens: number
   previousTier?: Tier
   limits: Limits
+  // prompts in a row that showed a failed attempt, this one included (v2 plan 4.3)
+  failures?: number
 }
 
 export type Decision = {
@@ -42,6 +44,8 @@ export type Decision = {
   why: string
   // what stopped a change, for the log
   held?: string
+  // the pick is a step up after a failed attempt
+  steppedUp?: boolean
 }
 
 const NAMES: Record<ModelKey, string> = { haiku: 'Haiku 5.5', sonnet: 'Sonnet 5.5', opus: 'Opus 5.5', fable: 'Fable 5.1' }
@@ -71,15 +75,15 @@ const s = (model: ModelKey, effort: Effort): Setup => ({ model, effort })
 // for review; deep is many files or sources, new ground, a result not checkable
 // at a glance, an unknown cause, a failed attempt, numbers that must tie out,
 // or a legal or tender text for an outside party. Frontier is a failed attempt
-// at work already rated deep: the judge cannot count attempts reliably (it saw
-// "failed twice" in 3 dev prompts, wrongly each time), so the session's own
-// tier is the evidence. Stakes (production, money, irreversible) never raise
+// at work already rated deep, or a second failure in a row: the judge cannot
+// count attempts reliably (it saw "failed twice" in 3 dev prompts, wrongly each
+// time), so the session's own tier and the failures code saw are the evidence. Stakes (production, money, irreversible) never raise
 // the tier: never-route-down keeps such work from moving down instead.
 // outside_audience and relied_on alone did not track the labels well enough
 // to raise it (section 11 of the v2 plan).
 const HARDER: readonly Flag[] = ['unknown_cause', 'failed_before', 'must_reconcile']
 
-export function tierOf(v: Verdict, previousTier?: Tier): Tier {
+export function tierOf(v: Verdict, previousTier?: Tier, failures = 0): Tier {
   const has = (f: Flag) => v.flags.includes(f)
   const many = v.scope === 'many'
   // Looking something up, or one known act, is light; many separate acts are a job.
@@ -90,7 +94,7 @@ export function tierOf(v: Verdict, previousTier?: Tier): Tier {
   const harder = (many && v.action !== 'edit') || !v.checkable || v.novelty === 'new' || HARDER.some(has) || legalText
   if (!harder) return 'standard'
   const deepBefore = previousTier === 'deep' || previousTier === 'frontier'
-  return has('failed_before') && deepBefore ? 'frontier' : 'deep'
+  return has('failed_before') && (deepBefore || failures >= 2) ? 'frontier' : 'deep'
 }
 
 // Section 4 of the v1 research and section 4.7 of the v2 plan.
@@ -145,6 +149,24 @@ function cheaper(x: Setup): Setup {
   if (x.model === 'fable') return s('opus', 'high')
   if (x.model === 'opus') return s('sonnet', 'medium')
   return x
+}
+
+// After a failed attempt (v2 plan 4.3): the same model one effort step up
+// first, which keeps the cache; a model step on the next failure in a row:
+// Sonnet to Opus high, Opus to xhigh, then Fable, and never Fable for research.
+const EFFORT_CAP: Record<ModelKey, Effort> = { haiku: 'high', sonnet: 'high', opus: 'xhigh', fable: 'max' }
+function effortUp(x: Setup): Setup | undefined {
+  const i = EFFORTS.indexOf(x.effort)
+  return i < EFFORTS.indexOf(EFFORT_CAP[x.model]) ? { ...x, effort: EFFORTS[i + 1] ?? x.effort } : undefined
+}
+function modelUp(x: Setup, domain: Domain): Setup {
+  if (x.model === 'haiku' || x.model === 'sonnet') return s('opus', 'high')
+  if (x.model === 'opus' && EFFORTS.indexOf(x.effort) < EFFORTS.indexOf('xhigh')) return s('opus', 'xhigh')
+  if (x.model === 'opus') return domain === 'research' ? x : s('fable', 'high')
+  return effortUp(x) ?? x
+}
+export function stepUp(current: Setup, failures: number, domain: Domain): Setup {
+  return failures <= 1 ? effortUp(current) ?? modelUp(current, domain) : modelUp(current, domain)
 }
 
 function atLeast(x: Setup, floor: Setup): Setup {
@@ -233,13 +255,17 @@ export function subagentRoute(job: SubagentJob, parent: Setup | undefined, inNev
 }
 
 export function decide(verdict: Verdict, ctx: PickContext): Decision {
-  // A first prompt continues nothing in this session.
-  const v = ctx.isFirstPrompt ? { ...verdict, continuation: false } : verdict
+  // A first prompt continues nothing in this session. A failure code saw counts
+  // as a failed attempt whatever the judge said.
+  const failures = ctx.failures ?? 0
+  const seen = ctx.isFirstPrompt ? { ...verdict, continuation: false } : verdict
+  const v = failures > 0 && !seen.flags.includes('failed_before') ? { ...seen, flags: [...seen.flags, 'failed_before' as const] } : seen
   const mechanical = isMechanical(v)
-  let tier = tierOf(v, ctx.previousTier)
+  let tier = tierOf(v, ctx.previousTier, failures)
   // A go-ahead or status reply resumes real work unless its step is mechanical
   // (push it, send it): at least standard, and the tier of the work it resumes.
-  if (v.continuation && !mechanical) {
+  // One lookup along the way ("tell me the existing slots") stays a lookup.
+  if (v.continuation && !mechanical && !(v.action === 'lookup' && v.scope === 'one')) {
     if (tier === 'light') tier = 'standard'
     if (ctx.previousTier && TIER_RANK[ctx.previousTier] > TIER_RANK[tier]) tier = ctx.previousTier
   }
@@ -256,6 +282,20 @@ export function decide(verdict: Verdict, ctx: PickContext): Decision {
     if (best.model !== 'opus' && best.model !== 'fable') best = s('opus', 'high')
   }
   if (neverDown) balanced = best
+
+  // A failed attempt mid-session: Best is the next step up the ladder, Balanced
+  // the cache-safe effort step. The table's pick stands when it is higher on
+  // the same model, or the act is risky.
+  const steppedUp = failures > 0
+  if (steppedUp) {
+    const rung = stepUp(ctx.current, failures, v.domain)
+    if (ctx.isFirstPrompt) best = atLeast(best, rung)
+    else {
+      best = best.model === ctx.current.model || v.risky ? atLeast(best, rung) : rung
+      const effortStep = stepUp(ctx.current, 1, v.domain)
+      balanced = weight(effortStep) < weight(best) ? effortStep : best
+    }
+  }
 
   // Plan limits: Balanced steps one notch cheaper when the week or the 5 hours run low.
   const tight = (ctx.limits.weekly ?? 0) >= 80 || (ctx.limits.fiveHour ?? 0) >= 85
@@ -296,7 +336,7 @@ export function decide(verdict: Verdict, ctx: PickContext): Decision {
     balanced = weight(own) < weight(ctx.stated) ? own : ctx.stated
   }
 
-  return { tier, neverDown, best, balanced, speak: speaks(best, balanced, v, tier, ctx), why, held }
+  return { tier, neverDown, best, balanced, speak: speaks(best, balanced, v, tier, ctx), why, held, steppedUp }
 }
 
 // Speak only when a change would help: any move up, a model change, or an

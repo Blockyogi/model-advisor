@@ -245,7 +245,7 @@ describe('v2 review fixes (section 3) and the log (section 4.8)', () => {
     const w = session(on, labels => labels.at(-1)!)
     await Promise.all([1, 2, 3].map(() => $.prompt.submit({ text: NOTICE, ...composer })))
     expect(await picks($, 'log')).toContain('3 prompts judged')
-    expect([...w.store.keys()]).toEqual(['log:session-1'])
+    expect([...w.store.keys()].filter(k => k.startsWith('log'))).toEqual(['log:session-1'])
   })
 
   test('4.8: each entry carries session, turn, final tier, floor, limits and the judge facts', async ($, on) => {
@@ -407,5 +407,82 @@ describe('v2 phase 4: two runs before a move down (4.5) and what the judge sees 
     await $.prompt.submit({ text: NOTICE, ...composer })
     expect(w.prompts[0]).toContain('assistant did: tools Edit 1, Bash 1; edited sync.ts; errors: Bash 1')
     expect(w.prompts[0]).toContain("assistant's last message: The CI test still fails. Want me to dig in?")
+  })
+})
+
+describe('v2 phase 5: a step up when an attempt fails (4.3), and past cases in the judge (4.4)', () => {
+  const fix = facts({ work: 'fix the sign-up crash', action: 'debug', scope: 'one' })
+  const earlier = { role: 'user' as const, text: 'Fix the sign-up crash on Android.' }
+  const edited = { role: 'assistant' as const, text: 'Fixed: the null check is in.', toolUses: [{ tool_use_id: 'u1', tool: 'Edit', input: { file_path: '/app/signup.ts' } }] }
+
+  test('"still broken" offers the same model one effort step up, then a model step on the next failure', async ($, on) => {
+    const w = session(on, labels => labels[0]!, () => reply(fix))
+    w.rows = [earlier, edited]
+    await $.prompt.submit({ text: 'Still broken, it crashes the same way.', ...composer })
+    expect(w.asked).toEqual([['Best: Sonnet 5.5 · high', 'Balanced: same as Best', 'Keep: Sonnet 5.5 · medium']])
+    const [entry] = w.store.get('log:session-1') as Record<string, unknown>[]
+    expect(entry).toMatchObject({ failure: 'you said it failed', failures: 1 })
+    w.rows = [...w.rows, { role: 'user', text: 'Still broken, it crashes the same way.' }, edited]
+    await $.prompt.submit({ text: "That didn't work either, same error.", ...composer })
+    expect(w.asked[1]).toEqual(['Best: Opus 5.5 · high', 'Balanced: same as Best', 'Keep: Sonnet 5.5 · high'])
+    expect((w.store.get('log:session-1') as Record<string, unknown>[])[1]).toMatchObject({ failures: 2, finalTier: 'frontier' })
+  })
+
+  test('a bare "ok" after a turn that ended with tests still failing is judged and offered a step up', async ($, on) => {
+    const w = session(on, labels => labels[0]!, () => reply({ ...fix, continuation: true }))
+    const red = { tool_use_id: 'u', tool: 'Bash', input: { command: 'npm test' }, isError: true as const }
+    w.rows = [earlier, { role: 'assistant', text: 'Two tests still fail. Shall I keep going?', toolUses: [red, red] }]
+    await $.prompt.submit({ text: 'ok', ...composer })
+    expect(w.judged).toBe(1)
+    expect(w.asked[0]?.[0]).toBe('Best: Sonnet 5.5 · high')
+    const [entry] = w.store.get('log:session-1') as Record<string, unknown>[]
+    expect(entry).toMatchObject({ failure: 'tests still failing', signals: { testFails: 2, testsRed: true } })
+  })
+
+  test('a turn that fell short counts only when the prompt carries on that work', async ($, on) => {
+    const w = session(on, labels => labels[0]!, () => reply(facts({ work: 'draft a post', action: 'draft', domain: 'copy' })))
+    w.rows = [earlier, { role: 'assistant', text: 'The build failed.', toolUses: [edited.toolUses[0]!, { tool_use_id: 'u2', tool: 'Bash', input: {}, isError: true }] }]
+    await $.prompt.submit({ text: 'Separately, draft a LinkedIn post about our launch.', ...composer })
+    const [entry] = w.store.get('log:session-1') as Record<string, unknown>[]
+    expect(entry).toMatchObject({ failures: 0, signals: { endedOnError: true } })
+    expect(entry?.failure).toBe(undefined)
+  })
+
+  test('a prompt with no failure starts the count again, and /clear drops it', async ($, on) => {
+    const w = session(on, labels => labels.at(-1)!, () => reply(fix))
+    w.rows = [earlier, edited]
+    await $.prompt.submit({ text: 'Still broken.', ...composer })
+    await $.prompt.submit({ text: 'Now add a loading spinner to the sign-up page.', ...composer })
+    await $.prompt.submit({ text: 'Still broken.', ...composer })
+    const log = w.store.get('log:session-1') as Record<string, unknown>[]
+    expect(log.map(x => x.failures)).toEqual([1, 0, 1])
+    await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
+    await $.prompt.submit({ text: 'Still broken.', ...composer })
+    expect((w.store.get('log:session-1') as Record<string, unknown>[]).at(-1)?.failures).toBe(1)
+  })
+
+  test('the judge sees past requests that share words, after the cached rubric, with the tier each needed', async ($, on) => {
+    const w = session(on, labels => labels.at(-1)!)
+    w.store.set('cases', [
+      { text: 'Draft the RERA legal notice to the builder about the refund.', tier: 'deep', session: 'old', turn: 3 },
+      { text: 'What does HTTP 429 mean?', tier: 'light', session: 'old', turn: 4 },
+    ])
+    await $.prompt.submit({ text: NOTICE, ...composer })
+    expect(w.systems[0]).not.toContain('RERA legal notice to the builder about')
+    expect(w.prompts[0]).toContain('<past>\n- needed deep work: Draft the RERA legal notice to the builder about the refund.\n</past>')
+    expect(w.prompts[0]).not.toContain('HTTP 429')
+    const cases = w.store.get('cases') as { text: string; tier: string }[]
+    expect(cases.at(-1)).toMatchObject({ text: NOTICE, tier: 'deep', session: 'session-1' })
+    expect((w.store.get('log:session-1') as Record<string, unknown>[])[0]).toMatchObject({ past: 1 })
+  })
+
+  test('when an attempt fails, the request before it is kept as needing one tier more', async ($, on) => {
+    const w = session(on, labels => labels.at(-1)!, () => reply(fix))
+    w.rows = [earlier, edited]
+    await $.prompt.submit({ text: 'Fix the sign-up crash on Android.', ...composer })
+    w.rows = [...w.rows, { role: 'user', text: 'Fix the sign-up crash on Android.' }, edited]
+    await $.prompt.submit({ text: 'Still broken.', ...composer })
+    const cases = w.store.get('cases') as { text: string; tier: string }[]
+    expect(cases.map(c => [c.text, c.tier])).toEqual([['Fix the sign-up crash on Android.', 'deep'], ['Still broken.', 'deep']])
   })
 })

@@ -4,7 +4,10 @@
 
 import type { EngineInterface, Register, SessionMessage } from 'claude-code'
 import type { AdvisorActive } from '../types'
-import { isSkippable, judgeRequest, ownWords, parseVerdict, statedSetup, summarizeTurns, type JudgeFacts, type TurnSummary, type Verdict } from './judge'
+import {
+  isSkippable, judgeRequest, nearestCases, ownWords, parseVerdict, reportsFailure, statedSetup, summarizeTurns, TIERS, turnFailure,
+  type JudgeFacts, type PastCase, type Tier, type TurnSignals, type TurnSummary, type Verdict,
+} from './judge'
 import {
   agree, decide, DISAGREE, isMechanical, label, MODELS, modelKey, movesDown, subagentJob, subagentRoute,
   type Decision, type Effort, type Limits, type Setup, type SubagentJob,
@@ -17,6 +20,8 @@ const IS_OFF = { plugin: 'model-advisor', key: 'isOff' } as const
 const SEEN_EFFORT = { plugin: 'model-advisor', key: 'seenEffort' } as const
 // Whether the task the main loop is on is never-route-down; its subagents keep the parent's setup.
 const TASK_NEVER_DOWN = { plugin: 'model-advisor', key: 'taskNeverDown' } as const
+// Prompts in a row that showed a failed attempt (v2 plan 4.3).
+const FAILURES = { plugin: 'model-advisor', key: 'failures' } as const
 
 const JUDGE_TIMEOUT_MS = 6000
 // Each session logs under its own key (`log:<session id>`); `log` holds the
@@ -25,6 +30,12 @@ const LEGACY_LOG_KEY = 'log'
 const LOG_PREFIX = 'log:'
 const SESSION_LOG_MAX = 500
 const SESSION_LOGS_KEPT = 300
+// Past requests the judge is shown when they share words with a new one (v2
+// plan 4.4 step 2): the opening of each prompt and the tier it turned out to
+// need, kept on this machine only, apart from the log.
+const CASES_KEY = 'cases'
+const CASES_KEPT = 300
+const CASE_CHARS = 400
 const DEFAULT_EFFORT: Record<'haiku' | 'sonnet' | 'opus' | 'fable', Effort> = { haiku: 'medium', sonnet: 'medium', opus: 'medium', fable: 'high' }
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']
 
@@ -56,6 +67,12 @@ export type LogEntry = {
   confidence?: string
   // a move down ran the judge twice: whether the runs agreed
   agreed?: boolean
+  // from phase 5: what showed a failed attempt, how many prompts in a row
+  // showed one, the turn before's signals, and how many past cases the judge saw
+  failure?: string
+  failures?: number
+  signals?: TurnSignals
+  past?: number
   continuation: boolean
   ongoing: boolean
   previousTier?: string
@@ -218,10 +235,36 @@ const MACHINE_ORIGINS = new Set<string>([
 // The plugin's `about` setting, read when the module loads.
 let about = ''
 
-async function judge($: $, text: string, recent: TurnSummary[], facts: Omit<JudgeFacts, 'previousTier'>, timeoutMs: number) {
+type Case = PastCase & { session: string; turn: number }
+
+async function readCases($: $): Promise<Case[]> {
+  try {
+    return ((await $.store.get(CASES_KEY)) as Case[] | undefined) ?? []
+  } catch {
+    return []
+  }
+}
+
+const harder = (t: Tier): Tier => TIERS[Math.min(TIERS.length - 1, TIERS.indexOf(t) + 1)] ?? t
+
+// Adds this prompt's case. When the attempt the prompt reports on failed, the
+// prompt before it in this session needed more than it got: one tier up.
+async function saveCase($: $, cases: Case[], c: Case, failed: boolean) {
+  try {
+    const before = failed ? cases.findLast(x => x.session === c.session && x.turn < c.turn) : undefined
+    const kept = cases.map(x => (x === before ? { ...x, tier: harder(x.tier) } : x))
+    await $.store.set(CASES_KEY, [...kept, c].slice(-CASES_KEPT))
+  } catch {
+    // past cases only sharpen the judge; never fail a prompt over them
+  }
+}
+
+async function judge(
+  $: $, text: string, recent: TurnSummary[], facts: Omit<JudgeFacts, 'previousTier'>, timeoutMs: number, past: readonly PastCase[],
+) {
   const previousTier = (await $.state.get(PREVIOUS_TIER)).value ?? undefined
   const started = Date.now()
-  const r = await $.model.complete(judgeRequest(text, recent, { ...facts, previousTier }, timeoutMs, about))
+  const r = await $.model.complete(judgeRequest(text, recent, { ...facts, previousTier }, timeoutMs, about, past))
   const verdict = r.isAnswered ? parseVerdict(r.text) : undefined
   if (!verdict) $.ui.log(`model-advisor: judge ${r.isAnswered ? 'reply unreadable' : r.reason}; left as is`, { to: 'debug' })
   return { verdict, ms: Date.now() - started, previousTier }
@@ -253,33 +296,50 @@ export const register: Register = (on, options) => {
   on('prompt.submit', async ($, e, next) => {
     if (MACHINE_ORIGINS.has(e.origin.kind)) return next(e)
     const text = ownWords(e.text)
-    if ((await $.state.get(IS_OFF)).value || isSkippable(text) || (await isPrintRun($))) return next(e)
+    if ((await $.state.get(IS_OFF)).value || (await isPrintRun($))) return next(e)
+    const skippable = isSkippable(text)
+    if (skippable && text.startsWith('/')) return next(e)
 
-    const [rows, usage, { setup: current, isLatest }, turns] = await Promise.all([
-      $.session.messages() as Promise<SessionMessage[]>,
+    const rows = (await $.session.messages()) as SessionMessage[]
+    const recent = summarizeTurns(rows)
+    const signals = recent.at(-1)?.signals
+    // A bare "ok, go on" keeps the setup, unless the turn before it fell short.
+    const turnFailed = turnFailure(signals)
+    if (skippable && !turnFailed) return next(e)
+
+    const [usage, { setup: current, isLatest }, turns, session, cases] = await Promise.all([
       $.session.usage(),
       currentSetup($),
       $.session.turns(),
+      $.session.id(),
+      readCases($),
     ])
     const isFirstPrompt = !rows.some(m => m.role === 'user' && m.text.trim())
     const contextTokens = isFirstPrompt ? 0 : usage.context.tokens ?? 0
-    const recent = summarizeTurns(rows)
     const facts = { isFirstPrompt, contextTokens }
-    const { verdict, ms, previousTier } = await judge($, text, recent, facts, JUDGE_TIMEOUT_MS)
+    const past = nearestCases(text, cases)
+    const { verdict, ms, previousTier } = await judge($, text, recent, facts, JUDGE_TIMEOUT_MS, past)
     if (!verdict) {
       if (isFirstPrompt) $.ui.toast('Model advisor: could not check this prompt, so it runs as set')
       return next(e)
     }
 
+    // A failed attempt shows in the person's words, or in a turn that fell
+    // short when this prompt carries on that work.
+    const carriesOn = skippable || verdict.continuation || verdict.action === 'debug'
+    const failure = reportsFailure(text) ? 'you said it failed' : carriesOn ? turnFailed : undefined
+    const failures = failure ? ((await $.state.get(FAILURES)).value ?? 0) + 1 : 0
+    await $.state.set(FAILURES, failures)
+
     const statedPick = stated(text)
     const limits = limitsOf(usage.rateLimits)
-    const ctx = { current, currentIsLatest: isLatest, stated: statedPick, isFirstPrompt, contextTokens, previousTier, limits }
+    const ctx = { current, currentIsLatest: isLatest, stated: statedPick, isFirstPrompt, contextTokens, previousTier, limits, failures }
     let d = decide(verdict, ctx)
     // A move down stands only if a second run agrees; a failed second run holds it.
     let agreed: boolean | undefined
     let judgeMs = ms
     if (movesDown(d, ctx)) {
-      const second = await judge($, text, recent, facts, JUDGE_TIMEOUT_MS)
+      const second = await judge($, text, recent, facts, JUDGE_TIMEOUT_MS, past)
       judgeMs += second.ms
       const checked = agree(d, second.verdict && decide(second.verdict, ctx), verdict, ctx)
       agreed = checked.held !== DISAGREE
@@ -299,7 +359,9 @@ export const register: Register = (on, options) => {
       kind: 'main', turn: turns + 1, origin: e.origin.kind, finalTier: d.tier, previousTier, neverDown: d.neverDown, limits,
       first: isFirstPrompt, contextK: Math.round(contextTokens / 1000), current: label(current),
       best: label(d.best), balanced: label(d.balanced), chosen, stated: !!statedPick, held: d.held, agreed, judgeMs,
+      failure, failures, signals, past: past.length,
     }))
+    if (!skippable) await saveCase($, cases, { text: text.slice(0, CASE_CHARS), tier: d.tier, session, turn: turns + 1 }, !!failure)
     // One brief sign on the first prompt that the advisor checked and found nothing to change.
     if (!pick && isFirstPrompt && chosen === 'silent')
       $.ui.toast(`Model advisor: ${label(current)} fits this work${statedPick ? ' (your prompt names it)' : ''}`)
@@ -328,6 +390,7 @@ export const register: Register = (on, options) => {
     if (e.reason === 'clear') {
       await $.state.set(PREVIOUS_TIER, null)
       await $.state.set(TASK_NEVER_DOWN, null)
+      await $.state.set(FAILURES, null)
       await $.state.set(ACTIVE, null)
       await showStatus($)
     }
@@ -440,6 +503,7 @@ async function logText($: $): Promise<string> {
     `${main.length} prompts judged, asked on ${asked}: Best ${count('best')}, Balanced ${count('balanced')}, Keep ${count('keep')}, ` +
       `dismissed ${count('dismissed')}, no one to ask ${count('no-one-to-ask')}.`,
     `After a pick you changed the picker ${events('picker-change')} times and used /picks clear ${events('picks-clear')} times.`,
+    `${main.filter(x => x.failure).length} prompts showed a failed attempt; ${main.filter(x => x.failure && (x.chosen === 'best' || x.chosen === 'balanced')).length} of the step-ups were taken.`,
     `${routes.length} subagents routed by type: ${routed('search')} search, ${routed('review')} review, ${routed('work')} work, ` +
       `${routes.filter(x => x.neverDown).length} kept on the parent.`,
     ...lines,

@@ -57,7 +57,7 @@ function whyNotLower(d: Decision, v: Verdict, isStated: boolean): string {
   if (v.domain === 'legal') return 'Legal letters are never routed down to save usage.'
   if (v.domain === 'tender') return 'Tender submissions are never routed down.'
   if (v.risky) return 'It changes production, money or data, so it is never routed down.'
-  if (v.flags.includes('failed_before')) return 'A fix already failed, so it is not routed down.'
+  if (v.flags.includes('failed_before') || d.steppedUp) return 'A fix already failed, so it is not routed down.'
   if (v.domain === 'copy' && v.flags.includes('outside_audience')) return 'Final public copy is never routed down.'
   if (d.neverDown) return 'Work like this is never routed down.'
   if (d.held) return `Not sure enough to go lower (${d.held}).`
@@ -71,7 +71,8 @@ export function questionText(d: Decision, v: Verdict, limits: Limits): string {
   const tier = sentence(d.tier)
   const why = d.why.replace(/[.\s]+$/, '')
   const weekly = limits.weekly === undefined ? '' : ` Weekly limit ${Math.round(limits.weekly)}% used.`
-  return `${tier} ${v.domain === 'other' ? '' : `${v.domain} `}work${why ? `: ${why}` : ''}.${weekly} Which setup should run it?`
+  const failed = d.steppedUp ? ' The last attempt fell short.' : ''
+  return `${tier} ${v.domain === 'other' ? '' : `${v.domain} `}work${why ? `: ${why}` : ''}.${failed}${weekly} Which setup should run it?`
 }
 
 export function rows(
