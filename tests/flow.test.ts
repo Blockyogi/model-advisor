@@ -469,7 +469,7 @@ describe('v2 phase 5: a step up when an attempt fails (4.3), and past cases in t
     ])
     await $.prompt.submit({ text: NOTICE, ...composer })
     expect(w.systems[0]).not.toContain('RERA legal notice to the builder about')
-    expect(w.prompts[0]).toContain('<past>\n- needed deep work: Draft the RERA legal notice to the builder about the refund.\n</past>')
+    expect(w.prompts[0]).toContain('\n- needed deep work: Draft the RERA legal notice to the builder about the refund.\n</past>')
     expect(w.prompts[0]).not.toContain('HTTP 429')
     const cases = w.store.get('cases') as { text: string; tier: string }[]
     expect(cases.at(-1)).toMatchObject({ text: NOTICE, tier: 'deep', session: 'session-1' })

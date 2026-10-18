@@ -264,8 +264,9 @@ export function decide(verdict: Verdict, ctx: PickContext): Decision {
   let tier = tierOf(v, ctx.previousTier, failures)
   // A go-ahead or status reply resumes real work unless its step is mechanical
   // (push it, send it): at least standard, and the tier of the work it resumes.
-  // One lookup along the way ("tell me the existing slots") stays a lookup.
-  if (v.continuation && !mechanical && !(v.action === 'lookup' && v.scope === 'one')) {
+  // That holds for a single lookup too: the judge calls status replies ("Mobbin
+  // is already connected.") a lookup of one thing, though they resume the work.
+  if (v.continuation && !mechanical) {
     if (tier === 'light') tier = 'standard'
     if (ctx.previousTier && TIER_RANK[ctx.previousTier] > TIER_RANK[tier]) tier = ctx.previousTier
   }
