@@ -245,7 +245,7 @@ describe('v2 review fixes (section 3) and the log (section 4.8)', () => {
     const w = session(on, labels => labels.at(-1)!)
     await Promise.all([1, 2, 3].map(() => $.prompt.submit({ text: NOTICE, ...composer })))
     expect(await picks($, 'log')).toContain('3 prompts judged')
-    expect([...w.store.keys()].filter(k => k.startsWith('log'))).toEqual(['log:session-1'])
+    expect([...w.store.keys()]).toEqual(['log:session-1'])
   })
 
   test('4.8: each entry carries session, turn, final tier, floor, limits and the judge facts', async ($, on) => {
@@ -410,7 +410,7 @@ describe('v2 phase 4: two runs before a move down (4.5) and what the judge sees 
   })
 })
 
-describe('v2 phase 5: a step up when an attempt fails (4.3), and past cases in the judge (4.4)', () => {
+describe('v2 phase 5: a step up when an attempt fails (4.3)', () => {
   const fix = facts({ work: 'fix the sign-up crash', action: 'debug', scope: 'one' })
   const earlier = { role: 'user' as const, text: 'Fix the sign-up crash on Android.' }
   const edited = { role: 'assistant' as const, text: 'Fixed: the null check is in.', toolUses: [{ tool_use_id: 'u1', tool: 'Edit', input: { file_path: '/app/signup.ts' } }] }
@@ -459,30 +459,5 @@ describe('v2 phase 5: a step up when an attempt fails (4.3), and past cases in t
     await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
     await $.prompt.submit({ text: 'Still broken.', ...composer })
     expect((w.store.get('log:session-1') as Record<string, unknown>[]).at(-1)?.failures).toBe(1)
-  })
-
-  test('the judge sees past requests that share words, after the cached rubric, with the tier each needed', async ($, on) => {
-    const w = session(on, labels => labels.at(-1)!)
-    w.store.set('cases', [
-      { text: 'Draft the RERA legal notice to the builder about the refund.', tier: 'deep', session: 'old', turn: 3 },
-      { text: 'What does HTTP 429 mean?', tier: 'light', session: 'old', turn: 4 },
-    ])
-    await $.prompt.submit({ text: NOTICE, ...composer })
-    expect(w.systems[0]).not.toContain('RERA legal notice to the builder about')
-    expect(w.prompts[0]).toContain('\n- needed deep work: Draft the RERA legal notice to the builder about the refund.\n</past>')
-    expect(w.prompts[0]).not.toContain('HTTP 429')
-    const cases = w.store.get('cases') as { text: string; tier: string }[]
-    expect(cases.at(-1)).toMatchObject({ text: NOTICE, tier: 'deep', session: 'session-1' })
-    expect((w.store.get('log:session-1') as Record<string, unknown>[])[0]).toMatchObject({ past: 1 })
-  })
-
-  test('when an attempt fails, the request before it is kept as needing one tier more', async ($, on) => {
-    const w = session(on, labels => labels.at(-1)!, () => reply(fix))
-    w.rows = [earlier, edited]
-    await $.prompt.submit({ text: 'Fix the sign-up crash on Android.', ...composer })
-    w.rows = [...w.rows, { role: 'user', text: 'Fix the sign-up crash on Android.' }, edited]
-    await $.prompt.submit({ text: 'Still broken.', ...composer })
-    const cases = w.store.get('cases') as { text: string; tier: string }[]
-    expect(cases.map(c => [c.text, c.tier])).toEqual([['Fix the sign-up crash on Android.', 'deep'], ['Still broken.', 'deep']])
   })
 })

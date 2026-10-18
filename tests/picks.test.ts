@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 import {
-  isSkippable, judgeUserMessage, nearestCases, parseVerdict, recentBlock, reportsFailure, statedSetup, summarizeTurns, turnFailure,
+  isSkippable, judgeUserMessage, parseVerdict, recentBlock, reportsFailure, statedSetup, summarizeTurns, turnFailure,
   type MessageRow, type Verdict,
 } from '../hooks/judge'
 import { agree, decide, DISAGREE, isMechanical, label, movesDown, stepUp, subagentJob, subagentRoute, tierOf, weight, type PickContext } from '../hooks/picks'
@@ -569,33 +569,5 @@ describe('phase 5: a step up when an attempt fails (4.3)', () => {
 describe('phase 5: the light-call gap (section 11)', () => {
   test('a one-item lookup that continues the work still carries it: status replies look like lookups to the judge', () => {
     expect(decide(light({ continuation: true }), mid({ previousTier: 'deep' })).tier).toBe('deep')
-  })
-})
-
-describe('phase 5: past cases (4.4 step 2)', () => {
-  const cases = [
-    { text: 'Draft the RERA legal notice to the builder for the refund.', tier: 'deep' as const },
-    { text: 'Push the passes to origin main.', tier: 'light' as const },
-    { text: 'Please tell me now, okay, what you think.', tier: 'standard' as const },
-  ]
-  test('word overlap finds similar requests; shared filler words alone do not count', () => {
-    expect(nearestCases('Draft a legal notice to the builder about delayed possession.', cases).map(c => c.tier)).toEqual(['deep'])
-    expect(nearestCases('Okay, please tell me what you think now.', cases)).toEqual([])
-    expect(nearestCases('x', cases)).toEqual([])
-    // paths and pasted shell commands are no sign of similar work
-    const paths = [{ text: 'Run the build in /Users/me/Desktop/Claude Code/app and report.', tier: 'deep' as const }]
-    expect(nearestCases('Open /Users/me/Desktop/Claude Code/notes.md', paths)).toEqual([])
-    expect(nearestCases("<bash-input>printf 'KEY=%s' >> /Users/me/Desktop/Claude Code/app/.env", paths)).toEqual([])
-  })
-  test('at most five, nearest first', () => {
-    const many = Array.from({ length: 8 }, (_, i) => ({ text: `rerun the sign-up tests ${'extra '.repeat(i)}`, tier: 'standard' as const }))
-    const near = nearestCases('rerun the sign-up tests', many)
-    expect(near.length).toBe(5)
-    expect(near[0]).toBe(many[0])
-  })
-  test('the past block comes before the recent turns and the request', () => {
-    const text = judgeUserMessage('Draft a legal notice to the builder.', [], { isFirstPrompt: true, contextTokens: 0 }, [cases[0]!])
-    expect(text).toMatch(/<past>\nEarlier requests from this person[^\n]*\n- needed deep work: Draft the RERA legal notice to the builder for the refund.\n<\/past>/)
-    expect(text.indexOf('<past>')).toBeLessThan(text.indexOf('<request>'))
   })
 })
