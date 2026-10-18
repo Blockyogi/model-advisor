@@ -541,9 +541,9 @@ describe('phase 5: a step up when an attempt fails (4.3)', () => {
   })
 
   test('the person\'s words: real failure reports count; "still" alone, doubt, quotes and plans that did not work out do not', () => {
-    for (const t of ['Still broken.', "That didn't work.", 'Same error as before', 'try again', 'The hero is still blank on mobile', 'Dev server link is not working.', 'This looks like it hasn\'t changed.'])
+    for (const t of ['Still broken.', "That didn't work.", 'Same error as before', 'try again', 'The header is still blank on mobile', 'The preview link is not working.', 'The page hasn\'t changed.'])
       expect([t, reportsFailure(t)]).toEqual([t, true])
-    for (const t of ['What is still open?', "I'm still not sure about the hook.", "Yesterday's post didn't work out well.", 'corrections ("still", "didn\'t work")', 'It is still missing a few foods.', 'Is it still running?'])
+    for (const t of ['What is still open?', "I'm still not sure about the hook.", 'The launch plan didn\'t work out.', 'corrections ("still", "didn\'t work")', 'The list is still missing two items.', 'Is the build still running?'])
       expect([t, reportsFailure(t)]).toEqual([t, false])
   })
 
