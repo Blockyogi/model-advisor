@@ -145,14 +145,14 @@ export type MessageRow = {
 
 // What in a turn can show that an attempt failed (v2 plan 4.3): failing test
 // runs and whether the last one was still red, the most edits made to one file,
-// and whether the turn ended on an error after editing something.
+// and whether the turn ended on a failed command after editing something.
 export type TurnSignals = { testFails: number; testsRed: boolean; sameFileEdits: number; endedOnError: boolean }
 
 // One turn: what the person typed, then everything the assistant did until they typed again.
 export type TurnSummary = { typed: string; work: string; reply: string; signals?: TurnSignals }
 
 const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
-const TEST_COMMAND = /\b(?:(?:npm|pnpm|yarn|bun)(?: run)? test|pytest|vitest|jest|go test|cargo test|swift test|xcodebuild\b[^|;&]*\btest|plugin test|python3? -m (?:pytest|unittest)|node --test|make test)\b/
+const TEST_COMMAND = /\b(?:(?:npm|pnpm|yarn|bun)(?: run)? test|(?:pytest|vitest|jest)\b(?![.\-\/])|go test|cargo test|swift test|xcodebuild\b[^|;&]*\btest|plugin test|python3? -m (?:pytest|unittest)|node --test|make test)\b/
 const toolName = (tool: string) => tool.replace(/^mcp__/, '').replace(/__/g, ':')
 const baseName = (path: string) => path.split('/').filter(Boolean).at(-1) ?? path
 
@@ -191,7 +191,8 @@ export function summarizeTurns(rows: readonly MessageRow[], max = RECENT_TURNS):
         turn.testsRed = use.isError === true
         if (use.isError) turn.testFails++
       }
-      turn.endedOnError = use.isError === true && turn.edits.size > 0
+      // a failed run after an edit (a build, a script, a check); a failed edit or read is no sign
+      turn.endedOnError = use.tool === 'Bash' && use.isError === true && turn.edits.size > 0
     }
   }
   const list = (m: Map<string, number>) => [...m].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k, n]) => `${k} ${n}`).join(', ')

@@ -286,13 +286,14 @@ export function decide(verdict: Verdict, ctx: PickContext): Decision {
 
   // A failed attempt mid-session: Best is the next step up the ladder, Balanced
   // the cache-safe effort step. The table's pick stands when it is higher on
-  // the same model, or the act is risky.
+  // the same model, or when the work was never routed down for its own sake
+  // (legal, risky, public text), so a failure never lowers that floor.
   const steppedUp = failures > 0
   if (steppedUp) {
     const rung = stepUp(ctx.current, failures, v.domain)
     if (ctx.isFirstPrompt) best = atLeast(best, rung)
     else {
-      best = best.model === ctx.current.model || v.risky ? atLeast(best, rung) : rung
+      best = best.model === ctx.current.model || isNeverDown(seen, tier) ? atLeast(best, rung) : rung
       const effortStep = stepUp(ctx.current, 1, v.domain)
       balanced = weight(effortStep) < weight(best) ? effortStep : best
     }

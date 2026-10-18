@@ -300,20 +300,21 @@ export const register: Register = (on, options) => {
     const skippable = isSkippable(text)
     if (skippable && text.startsWith('/')) return next(e)
 
-    const rows = (await $.session.messages()) as SessionMessage[]
-    const recent = summarizeTurns(rows)
-    const signals = recent.at(-1)?.signals
+    const messages = $.session.messages() as Promise<SessionMessage[]>
     // A bare "ok, go on" keeps the setup, unless the turn before it fell short.
-    const turnFailed = turnFailure(signals)
-    if (skippable && !turnFailed) return next(e)
+    if (skippable && !turnFailure(summarizeTurns(await messages).at(-1)?.signals)) return next(e)
 
-    const [usage, { setup: current, isLatest }, turns, session, cases] = await Promise.all([
+    const [rows, usage, { setup: current, isLatest }, turns, session, cases] = await Promise.all([
+      messages,
       $.session.usage(),
       currentSetup($),
       $.session.turns(),
       $.session.id(),
       readCases($),
     ])
+    const recent = summarizeTurns(rows)
+    const signals = recent.at(-1)?.signals
+    const turnFailed = turnFailure(signals)
     const isFirstPrompt = !rows.some(m => m.role === 'user' && m.text.trim())
     const contextTokens = isFirstPrompt ? 0 : usage.context.tokens ?? 0
     const facts = { isFirstPrompt, contextTokens }
@@ -351,7 +352,8 @@ export const register: Register = (on, options) => {
     const pick = chosen === 'best' ? d.best : chosen === 'balanced' ? d.balanced : undefined
     // Only ongoing work that needs thought sets the tier a later continuation
     // inherits: a push or a quick aside in between leaves it as it was.
-    if (verdict.ongoing && !isMechanical(verdict)) {
+    // A failed attempt is real work even when its step looked mechanical.
+    if (verdict.ongoing && (failures > 0 || !isMechanical(verdict))) {
       await $.state.set(PREVIOUS_TIER, d.tier)
       await $.state.set(TASK_NEVER_DOWN, d.neverDown)
     } else if (d.neverDown) await $.state.set(TASK_NEVER_DOWN, true)

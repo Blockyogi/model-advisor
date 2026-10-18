@@ -512,6 +512,12 @@ describe('phase 5: a step up when an attempt fails (4.3)', () => {
     expect([label(d.best), label(d.balanced)]).toEqual(['Sonnet 5.5 · high', 'Sonnet 5.5 · high'])
   })
 
+  test('a failure never lowers the floor of work that is never routed down for its own sake', () => {
+    const v = verdict({ action: 'draft', scope: 'one', domain: 'legal', flags: ['outside_audience'] })
+    const d = decide(v, mid({ current: sonnet('low'), failures: 1 }))
+    expect(label(d.best)).toBe('Opus 5.5 · high')
+  })
+
   test('the table wins when it asks for more on the same model', () => {
     const d = decide(deep({ action: 'debug', flags: ['unknown_cause'] }), mid({ failures: 1 }))
     expect(label(d.best)).toBe('Opus 5.5 · xhigh')
@@ -550,6 +556,10 @@ describe('phase 5: a step up when an attempt fails (4.3)', () => {
     expect(turnFailure(turn([npm(true), npm(true), npm(false)]))).toBe(undefined)
     expect(turnFailure(turn([edit, { tool: 'Bash', input: { command: 'swift build' }, isError: true }]))).toBe('ended on an error')
     expect(turnFailure(turn([{ tool: 'Bash', input: { command: 'grep x' }, isError: true }]))).toBe(undefined)
+    // a denied or failed edit is no failed run, and reading jest.config.js is no test run
+    expect(turnFailure(turn([edit, { tool: 'Edit', input: { file_path: '/app/a.ts' }, isError: true }]))).toBe(undefined)
+    const cat = { tool: 'Bash', input: { command: 'cat jest.config.js' }, isError: true as const }
+    expect(turn([cat, cat])?.testFails).toBe(0)
     const edits = turn([edit, edit, edit])
     expect(edits?.sameFileEdits).toBe(3)
     expect(turnFailure(edits)).toBe(undefined)
